@@ -1,0 +1,17 @@
+{
+  "name": "donna",
+  "version": "2.0.0",
+  "description": "Autonomous calendar agent: Google Calendar, tasks, habits, booking page — free to run",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js --open",
+    "test": "node scripts/build.js && node test/selftest.js && node test/v3.js && node test/v4.js",
+    "eval": "node eval/run.js",
+    "deploy": "node scripts/build.js && npx wrangler deploy",
+    "build": "node scripts/build.js"
+  }
+}

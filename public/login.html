@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Donna</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#4f46e5">
+<link rel="stylesheet" href="/app.css">
+<style>
+  body { display: grid; place-items: center; min-height: 100vh; padding: 16px; }
+  .login { width: min(380px, 100%); }
+  .login .logo { width: 44px; height: 44px; border-radius: 13px; margin-bottom: 14px; }
+  .login h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -.02em; }
+  .login .btn { width: 100%; margin-top: 16px; min-height: 40px; }
+  .err { color: var(--danger); font-size: 13px; min-height: 18px; margin-top: 10px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+  <form class="card login" id="f">
+    <img class="logo" src="/icon.svg" alt="">
+    <h1>Welcome back</h1>
+    <p class="hint" style="margin:0 0 4px">Sign in to your calendar agent.</p>
+    <button class="btn primary passkey-btn hidden" type="button" id="pk">
+      <svg class="i" viewBox="0 0 24 24"><path d="M12 11c0 3-1 6-3 8M15 12c0 3-.6 5.4-1.7 7.3M8.6 8.1A4 4 0 0 1 16 10M5 13a7 7 0 0 1 12.6-6.2M19 11.5c0 2.5-.3 4.8-1 6.8"/></svg>
+      <span id="pkLabel">Sign in with fingerprint / face</span></button>
+    <div class="or hidden" id="or">or use your password</div>
+    <label class="f" style="margin-top:14px">Password<input type="password" id="pw" autocomplete="current-password webauthn" required></label>
+    <button class="btn" type="submit" id="pwBtn">Sign in</button>
+    <div class="err" id="err" role="alert"></div>
+  </form>
+<script>
+  'use strict';
+  if (localStorage.getItem('donna.theme')) document.documentElement.dataset.theme = JSON.parse(localStorage.getItem('donna.theme')) || '';
+  const $ = id => document.getElementById(id);
+  const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const unb64u = s => { const t = s.replace(/-/g, '+').replace(/_/g, '/'); return Uint8Array.from(atob(t + '='.repeat((4 - t.length % 4) % 4)), c => c.charCodeAt(0)); };
+  const isApple = /iPhone|iPad|Macintosh/.test(navigator.userAgent);
+  const isWindows = /Windows/.test(navigator.userAgent);
+  $('pkLabel').textContent = isWindows ? 'Sign in with Windows Hello' : isApple ? (/iPhone|iPad/.test(navigator.userAgent) ? 'Sign in with Face ID' : 'Sign in with Touch ID') : 'Sign in with fingerprint / face';
+  const done = () => { location.href = '/'; };
+
+  let pending = null; // the autofill (conditional) request, cancelled when the button is pressed
+  async function passkey(conditional) {
+    if (pending) { pending.abort(); pending = null; }
+    const ctl = new AbortController();
+    if (conditional) pending = ctl;
+    const err = $('err');
+    err.textContent = '';
+    try {
+      const { challenge, rpId, registered } = await (await fetch('/api/passkey/challenge')).json();
+      if (!registered && !conditional) { err.textContent = 'No passkey yet. Sign in with the password once, then add this device in Settings → Security.'; return; }
+      const cred = await navigator.credentials.get({ publicKey: { challenge: unb64u(challenge), rpId, userVerification: 'required', timeout: 60000 }, signal: ctl.signal, ...(conditional ? { mediation: 'conditional' } : {}) });
+      if (!cred) return;
+      const r = cred.response;
+      const res = await fetch('/api/passkey/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        id: cred.id, clientDataJSON: b64u(r.clientDataJSON), authenticatorData: b64u(r.authenticatorData), signature: b64u(r.signature) }) });
+      if (res.ok) { localStorage.setItem('donna.passkey', 'true'); return done(); }
+      err.textContent = (await res.json().catch(() => ({}))).error || 'Passkey sign-in failed.';
+    } catch (e) {
+      if (!conditional && e.name !== 'AbortError') err.textContent = e.name === 'NotAllowedError' ? 'Cancelled, or no passkey for this site on this device.' : e.message;
+    }
+  }
+
+  if (window.PublicKeyCredential) {
+    $('pk').classList.remove('hidden'); $('or').classList.remove('hidden');
+    $('pk').onclick = () => passkey(false);
+    if (localStorage.getItem('donna.passkey') === 'true') { $('pk').focus(); }
+    else { $('pwBtn').classList.add('primary'); $('pk').classList.remove('primary'); }
+    // Passkeys also show up in the password field's autofill list.
+    PublicKeyCredential.isConditionalMediationAvailable?.().then(ok => { if (ok) passkey(true); }).catch(() => {});
+  } else $('pwBtn').classList.add('primary');
+
+  $('f').onsubmit = async e => {
+    e.preventDefault();
+    const err = $('err');
+    err.textContent = '';
+    const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: $('pw').value }) });
+    if (r.ok) done();
+    else err.textContent = (await r.json().catch(() => ({}))).error || 'Sign-in failed';
+  };
+</script>
+</body>
+</html>

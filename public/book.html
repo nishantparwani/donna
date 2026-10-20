@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book a time</title>
+<meta name="robots" content="noindex">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#4f46e5">
+<link rel="stylesheet" href="/app.css">
+<style>
+  body { min-height: 100vh; padding: 24px 16px 60px; }
+  .page { max-width: 760px; margin: 0 auto; }
+  .head { display: flex; gap: 14px; align-items: center; margin-bottom: 18px; }
+  .head img { width: 42px; height: 42px; border-radius: 12px; }
+  .head h1 { font-size: 22px; margin: 0; letter-spacing: -.02em; }
+  .grid { display: grid; grid-template-columns: 240px 1fr; gap: 16px; }
+  .days { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow: auto; }
+  .day { text-align: left; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 9px 12px; cursor: pointer; display: flex; justify-content: space-between; }
+  .day:hover { border-color: var(--accent); }
+  .day.on { border-color: var(--accent); background: var(--accent-2); color: var(--accent); font-weight: 600; }
+  .times { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; align-content: start; }
+  .time { border: 1px solid var(--accent); color: var(--accent); background: var(--panel); border-radius: 9px; padding: 9px 0; cursor: pointer; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .time:hover, .time.on { background: var(--accent); color: var(--accent-text); }
+  .done { text-align: center; padding: 30px 16px; }
+  .done .big { font-size: 40px; }
+  @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } .days { flex-direction: row; overflow-x: auto; max-height: none; } .day { flex: none; flex-direction: column; } }
+</style>
+</head>
+<body>
+<div class="page" id="page"><div class="card empty">Loading…</div></div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const slug = location.pathname.split('/')[2] || '';
+const params = new URLSearchParams(location.search);
+const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const longDate = d => { const x = new Date(d + 'T12:00'); return `${DAYS[x.getDay()]}, ${x.getDate()} ${MONTHS[x.getMonth()]}`; };
+const add = (s, m) => { const x = new Date(s); x.setMinutes(x.getMinutes() + m); const p = n => String(n).padStart(2, '0'); return `${p(x.getHours())}:${p(x.getMinutes())}`; };
+async function api(path, data) {
+  const r = await fetch(path, data ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) } : {});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'Something went wrong');
+  return j;
+}
+const st = { info: null, duration: null, slots: null, day: null, time: null };
+
+async function boot() {
+  if (params.get('cancel')) return cancelView(params.get('cancel'));
+  try { st.info = await api(`/api/public/booking?slug=${encodeURIComponent(slug)}`); }
+  catch (e) { $('page').innerHTML = `<div class="card empty"><b>This page isn't available</b>${esc(e.message)}</div>`; return; }
+  document.title = st.info.title;
+  st.duration = st.info.durations[0];
+  await loadSlots();
+}
+async function loadSlots() {
+  $('page').innerHTML = shell('<div class="empty">Finding free times…</div>');
+  st.slots = await api(`/api/public/slots?slug=${encodeURIComponent(slug)}&duration=${st.duration}`);
+  st.day = st.slots.days[0] ? st.slots.days[0].date : null;
+  st.time = null;
+  render();
+}
+function shell(inner) {
+  const i = st.info;
+  return `<div class="head"><img src="/icon.svg" alt=""><div><h1>${esc(i.title)}</h1><div class="hint">${esc(i.intro || 'Pick a time that works for you.')} Times are in ${esc(i.timeZone)}.</div></div></div>
+    ${i.durations.length > 1 ? `<div class="seg" style="margin-bottom:14px">${i.durations.map(d => `<button data-dur="${d}" class="${d === st.duration ? 'on' : ''}">${d} min</button>`).join('')}</div>` : ''}
+    <div class="card">${inner}</div>`;
+}
+function render() {
+  const days = st.slots.days;
+  if (!days.length) { $('page').innerHTML = shell('<div class="empty"><b>No free times right now</b>Please check back later.</div>'); bindDur(); return; }
+  const day = days.find(d => d.date === st.day) || days[0];
+  let inner = `<div class="grid"><div class="days">${days.map(d => `<button class="day ${d.date === day.date ? 'on' : ''}" data-day="${d.date}"><span>${esc(d.label)}</span><span class="hint">${d.times.length}</span></button>`).join('')}</div>
+    <div><div style="font-weight:600;margin-bottom:10px">${longDate(day.date)}</div><div class="times">${day.times.map(t => `<button class="time ${t === st.time ? 'on' : ''}" data-time="${t}">${t}</button>`).join('')}</div>
+    ${st.time ? `<form id="f" style="margin-top:18px;display:flex;flex-direction:column;gap:12px">
+      <div class="banner info"><b>${longDate(day.date)} · ${st.time}–${add(day.date + 'T' + st.time, st.duration)}</b></div>
+      <label class="f">Your name<input name="name" required maxlength="80" autocomplete="name"></label>
+      <label class="f">Email<input name="email" type="email" required maxlength="200" autocomplete="email"></label>
+      <label class="f">Anything to share? (optional)<textarea name="note" rows="2" maxlength="1000"></textarea></label>
+      <button class="btn primary" style="min-height:42px">Confirm booking</button><div class="hint" id="err" style="color:var(--danger)"></div></form>` : ''}</div></div>`;
+  $('page').innerHTML = shell(inner);
+  bindDur();
+  document.querySelectorAll('[data-day]').forEach(b => b.onclick = () => { st.day = b.dataset.day; st.time = null; render(); });
+  document.querySelectorAll('[data-time]').forEach(b => b.onclick = () => { st.time = b.dataset.time; render(); document.querySelector('#f input').focus(); });
+  const f = $('f');
+  if (f) f.onsubmit = async e => {
+    e.preventDefault();
+    const btn = f.querySelector('button'); btn.disabled = true; btn.textContent = 'Booking…';
+    try {
+      const r = await api('/api/public/book', { slug, name: f.name.value, email: f.email.value, note: f.note.value, start: `${day.date}T${st.time}`, duration: st.duration });
+      const cancel = `${location.origin}/book/${slug}?cancel=${r.token}`;
+      $('page').innerHTML = shell(`<div class="done"><div class="big">✅</div><h2 style="margin:8px 0 4px">You're booked</h2>
+        <p>${longDate(r.start.slice(0, 10))} · ${r.start.slice(11)}–${r.end.slice(11)} (${esc(st.info.timeZone)})</p>
+        <p class="hint">A calendar invitation is on its way to ${esc(f.email.value)}.</p>
+        ${r.meetLink ? `<p><a class="btn primary" href="${esc(r.meetLink)}" target="_blank" rel="noopener">Google Meet link</a></p>` : ''}
+        <p class="hint">Need to cancel? Keep this link: <br><a href="${esc(cancel)}">${esc(cancel)}</a></p></div>`);
+    } catch (err) {
+      $('err').textContent = err.message; btn.disabled = false; btn.textContent = 'Confirm booking';
+      if (/taken/.test(err.message)) setTimeout(loadSlots, 1500);
+    }
+  };
+}
+function bindDur() { document.querySelectorAll('[data-dur]').forEach(b => b.onclick = () => { st.duration = +b.dataset.dur; loadSlots(); }); }
+async function cancelView(token) {
+  try {
+    const b = await api(`/api/public/cancel?token=${encodeURIComponent(token)}`);
+    const when = `${longDate(b.start.slice(0, 10))} · ${b.start.slice(11)}–${b.end.slice(11)}`;
+    if (b.status === 'cancelled') { $('page').innerHTML = `<div class="card done"><div class="big">🗓️</div><h2>Already cancelled</h2><p class="hint">${when}</p></div>`; return; }
+    $('page').innerHTML = `<div class="card done"><h2>Cancel your booking?</h2><p>${esc(b.name)} · ${when}</p><button class="btn danger" id="c">Yes, cancel it</button><div class="hint" id="err"></div></div>`;
+    $('c').onclick = async () => {
+      try { await api('/api/public/cancel', { token }); $('page').innerHTML = `<div class="card done"><div class="big">👋</div><h2>Cancelled</h2><p class="hint">${when} is free again.</p></div>`; }
+      catch (e) { $('err').textContent = e.message; }
+    };
+  } catch (e) { $('page').innerHTML = `<div class="card empty"><b>Booking not found</b>${esc(e.message)}</div>`; }
+}
+if (localStorage.getItem('donna.theme')) { try { document.documentElement.dataset.theme = JSON.parse(localStorage.getItem('donna.theme')) || ''; } catch { /* ignore */ } }
+boot();
+</script>
+</body>
+</html>

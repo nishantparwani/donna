@@ -1,0 +1,29 @@
+name = "donna"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+workers_dev = true
+minify = true
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = true
+
+[ai]
+binding = "AI"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "donna"
+database_id = "PASTE_YOUR_D1_DATABASE_ID"   # npx wrangler d1 create donna
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[observability]
+enabled = true
+
+# Optional: your own domain
+# [[routes]]
+# pattern = "donna.example.com"
+# custom_domain = true
