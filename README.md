@@ -18,10 +18,10 @@ Free to run: Cloudflare Workers + D1 + Workers AI, a small Google Apps Script br
 ## What she does
 | You say | Donna does |
 |---|---|
-| "CFA 2h tomorrow" | Picks the **best** slot, not the first one: study goes into your peak-focus hours |
-| "Plan my day: CFA 2h, project, 5k run, assignments — max productivity" | Builds the whole day around fixed classes: focus-length blocks, breaks, lunch and dinner, no useless 20-minute scraps |
+| "CVT 2h tomorrow" | Picks the **best** slot, not the first one: study goes into your peak-focus hours |
+| "Plan my day: CVT 2h, project, 5k run, assignments — max productivity" | Builds the whole day around fixed classes: focus-length blocks, breaks, lunch and dinner, no useless 20-minute scraps |
 | "OS assignment due Friday, ~4 hours" | Books study sessions spread over the days before it's due, with a day of slack |
-| "Cancel SE and AI lecture, write CFA instead" | Cancels exactly those two (course codes and typos understood) and books CFA in the freed time |
+| "Cancel SE and AI lecture, write CVT instead" | Cancels exactly those two (course codes and typos understood) and books CVT in the freed time |
 | "I woke up just now" | Re-plans the rest of today from now, keeping classes fixed |
 | "Gym 1h sometime between 5 and 9pm on weekdays" | A habit placed in the best free slot each day |
 | "DSA every weekday 7:30pm till 30 Nov" | One real repeating Google event |
