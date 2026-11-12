@@ -25,33 +25,39 @@ Free to run: Cloudflare Workers + D1 + Workers AI, a small Google Apps Script br
 | "I woke up just now" | Re-plans the rest of today from now, keeping classes fixed |
 | "Gym 1h sometime between 5 and 9pm on weekdays" | A habit placed in the best free slot each day |
 | "DSA every weekday 7:30pm till 30 Nov" | One real repeating Google event |
+| "Remind me to renew my passport" | Undated reminder on your list and in a Monday overview calendar event |
+| "Travel 12 to 3pm color red" | High-priority booking: clears conflicting lower-priority events with one-tap Undo |
+| "Call with Priya tomorrow 3pm and invite her" | Sends a Google invite with a Meet link (never emails anyone unless asked) |
 | "undo that" | Reverts the whole last request |
 
 **Evening autopilot:** open the app after 6 pm and Donna gets tomorrow ready on her own: task sessions,
 habits, buffers around exams and interviews, clashes fixed.
 
 ## Built so you can trust it
+- **Learns your peak hours:** learns hour-by-hour from your Done / Missed check-ins, edits, and feedback (`src/rhythm.js`) without outvoting hard limits (sleep, classes, deadlines).
 - **Your call:** every change Donna makes on her own shows up on the home screen with the reason, and a
   **Keep** / **Undo** button. Keeping teaches her; undoing reverts just that change. A weekly ledger shows
   how many changes she made and how many you kept.
 - **Who placed what:** every block is marked as yours, "you asked", or placed by Donna, with a *Why here* line.
 - **Your energy, visible:** a day strip shades your energy curve (from your own wake-up and wind-down
   times), so you can see why deep work lands where it does.
+- **Colours as priorities:** 11 Google Calendar colours ranked by priority; higher-priority bookings clear lower-priority events automatically (optional, off by default for uncoloured).
 - **Rules in code, not hope:** she never cancels anything you didn't ask to cancel, never double-books,
   never touches protected events (classes, exams, family) unless you name them, and "undo" only runs when you
   actually ask for it. Answers are self-checked (claimed changes vs real changes, times in the report vs times booked).
-- **Passkeys:** sign in with Windows Hello, Touch ID or Face ID; "sign out all other devices" in one tap.
+- **Passkeys & Vault:** sign in with Windows Hello, Touch ID or Face ID; API keys and tokens are encrypted at rest with AES-256-GCM in D1.
 
 ## Fast
-- The next ~6 weeks of your calendar are kept in the database, so the app opens instantly and never waits
+- The next ~6 weeks of your calendar are kept in the database (`gcache`), so the app opens instantly and never waits
   on Google; it checks Google in the background and redraws only if something changed.
-- The app shell and your last view load from the device first (installable PWA).
+- All request state changes save to D1 in **one atomic transaction** (`writeMany`).
+- A writer lock (`WriterLock` Durable Object) prevents multi-device write races.
+- The app shell and your last view load from the device first (installable PWA with "Timetable" aesthetic).
 - A reply never takes more than ~40 s; if the AI is slow she tells you what she managed instead of spinning.
 
 ## How it decides where things go
-`src/smart.js` scores every possible start time:
-- **Energy:** deep work (study, coding, projects) in peak hours, light work (email, review) in the
-  post-lunch dip, workouts in the morning or early evening — anchored on *your* wake-up time.
+`src/smart.js` and `src/rhythm.js` score every possible start time:
+- **Energy:** deep work in peak hours, light work in the post-lunch dip, workouts in the morning or early evening — anchored on *your* wake-up time and personal rhythm.
 - **No waste:** a placement that leaves a 10–25 minute gap nobody can use loses points.
 - **Rhythm:** no two deep blocks glued together; parts of one item spread out; no deep work straight after a long lab.
 - **Deadlines:** sessions spread over days, finished a day early when possible, lighter days first.
@@ -62,17 +68,17 @@ habits, buffers around exams and interviews, clashes fixed.
 ## Architecture
 ```
 Browser / phone (PWA)  ──►  Cloudflare Worker (worker.js, src/api.js)
-                              ├─ D1: settings, tasks, habits, action log, saved calendar copy
+                              ├─ D1: settings, tasks, habits, action log, saved calendar copy, encrypted vault
                               ├─ AI router (src/llm.js): Gemini → Groq/Cerebras → Workers AI, auto-failover
                               ├─ Engine (src/engine.js): tools + guardrails + undo
-                              ├─ Planner (src/planner.js, src/dayplan.js, src/smart.js)
+                              ├─ Planner (src/planner.js, src/dayplan.js, src/smart.js, src/rhythm.js)
                               └─ Google Apps Script bridge (bridge/Code.gs) ──► Google Calendar
 ```
 
 ## Run it yourself
 **On your laptop (practice calendar, no Google needed):**
 ```
-npm test          # 70+ offline tests, no network
+npm test          # 136 offline tests + 14-scenario scheduling benchmark, no network
 npm start         # http://localhost:4321 — Settings → load the demo week, add a free Gemini key
 ```
 (or double-click `Start Donna.bat` on Windows)
@@ -86,6 +92,10 @@ npm start         # http://localhost:4321 — Settings → load the demo week, a
    [Apps Script](https://script.google.com) project, add the *Google Calendar API* service, deploy as a web
    app (access: Anyone), paste the `/exec` URL back and press *Test connection*.
 6. Settings → Security: add a passkey for this device.
+
+## Testing & Quality
+- `npm test`: 136 offline checks across 8 suites + a 14-scenario scheduling benchmark (`eval/plan-bench.js`); offline, ~20 s.
+- 95-scenario evaluation suite (`eval/crud.js`) validating natural language understanding, Hinglish parsing, and edge cases.
 
 ## Privacy
 Your calendar data stays in your own Cloudflare account and your own Google account. Nothing is sent
