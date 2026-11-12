@@ -4,7 +4,7 @@
 import * as T from './time.js';
 import * as cal from './calendar.js';
 import { load, save, settings } from './store.js';
-import { TOOLS, RUN, isTimed, isPing } from './engine.js';
+import { TOOLS, RUN, isTimed, isPing, dayEndOn } from './engine.js';
 
 const GOAL_SUFFIX = ' (weekly goal)';
 const words = s => String(s || '').toLowerCase().split(/[,;]/).map(x => x.trim()).filter(Boolean);
@@ -27,27 +27,37 @@ function weekMinutes(g, ws, ownTaskIds) {
   return { planned, done };
 }
 
-/** Keeps one task per goal for the current week sized to the shortfall. Called by the planner. */
+/**
+ * Keeps one task per goal per week, sized to the shortfall. Called by the planner.
+ * In the week a goal is set, it asks for at most that week's remaining share ("10h a week" set on Saturday books ~3h),
+ * and from Friday on next week's share is booked too, so the coming week is visible before it starts.
+ */
 export function syncGoals() {
   const goals = load('goals').items.filter(g => g.active !== false);
   const tasks = load('tasks');
   const ws = T.weekStart(T.today());
   const s = settings();
   for (const t of tasks.items) if (t.goalId && t.week < ws && t.status === 'open') t.status = 'done'; // last week's are over
+  const weeks = [ws, ...([5, 6, 0].includes(T.dow(T.today())) ? [T.addDays(ws, 7)] : [])];
   for (const g of goals) {
     const mine = tasks.items.filter(t => t.goalId === g.id);
-    let t = mine.find(x => x.week === ws);
-    const { planned } = weekMinutes(g, ws, new Set(mine.map(x => x.id)));
-    const need = Math.max(0, g.minutesPerWeek - planned);
-    if (!t) {
-      if (need < 30) continue;
-      t = { id: 'T' + (++tasks.seq), title: g.title + GOAL_SUFFIX, goalId: g.id, week: ws, minutes: need, due: T.addDays(ws, 6) + 'T' + s.dayEnd,
-        priority: 'normal', sessionMinutes: Math.min(Number(s.focusSpan) || 90, 120), notes: '', status: 'open', created: T.nowStr(), sessions: [], spent: 0 };
-      tasks.items.push(t);
-    } else if (t.status === 'open') {
-      // The task covers only what the user's own blocks don't; booked sessions stay counted in it.
-      t.minutes = Math.max(need, 15);
-      if (need < 15) t.status = 'done';
+    for (const w of weeks) {
+      let t = mine.find(x => x.week === w);
+      const { planned } = weekMinutes(g, w, new Set(mine.map(x => x.id)));
+      const born = T.day(g.created || '2000-01-01');
+      // The week it was set in: never ask for more than that week's remaining share.
+      const left = born > w ? Math.max(0, 7 - Math.round(T.diffMin(w + 'T00:00', born + 'T00:00') / 1440)) : 7;
+      const need = Math.min(Math.max(0, g.minutesPerWeek - planned), Math.round(g.minutesPerWeek * left / 7 / 15) * 15);
+      if (!t) {
+        if (need < 30) continue;
+        t = { id: 'T' + (++tasks.seq), title: g.title + GOAL_SUFFIX, goalId: g.id, week: w, minutes: need, due: dayEndOn(T.addDays(w, 6), s),
+          priority: 'normal', sessionMinutes: Math.min(Number(s.focusSpan) || 90, 120), notes: '', status: 'open', created: T.nowStr(), sessions: [], spent: 0 };
+        tasks.items.push(t);
+      } else if (t.status === 'open') {
+        // The task covers only what the user's own blocks don't; booked sessions stay counted in it.
+        t.minutes = Math.max(need, 15);
+        if (need < 15) t.status = 'done';
+      }
     }
   }
   save('tasks');

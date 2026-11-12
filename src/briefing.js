@@ -55,8 +55,8 @@ export function briefing(kind = 'morning') {
   const { free, longest } = freeMinutes(d);
   const name = s.userName ? s.userName.split(' ')[0] : '';
   const head = kind === 'morning'
-    ? `☀️ Good morning${name ? ', ' + name : ''}. ${T.DAY_NAMES[T.dow(d)]}: ${timed.length} event${timed.length === 1 ? '' : 's'}, ${fmtMins(free)} free${longest >= 60 ? ` (longest stretch ${fmtMins(longest)})` : ''}.`
-    : `🌙 Tomorrow (${T.DAY_NAMES[T.dow(d)]} ${T.human(d + 'T00:00').slice(4, -6)}): ${timed.length} event${timed.length === 1 ? '' : 's'}${timed[0] ? `, first at ${T.clock(timed[0].start)}` : ''}.`;
+    ? `Good morning${name ? ', ' + name : ''}. ${T.DAY_NAMES[T.dow(d)]}: ${timed.length} event${timed.length === 1 ? '' : 's'}, ${fmtMins(free)} free${longest >= 60 ? ` (longest stretch ${fmtMins(longest)})` : ''}.`
+    : `Tomorrow (${T.DAY_NAMES[T.dow(d)]} ${T.human(d + 'T00:00').slice(4, -6)}): ${timed.length} event${timed.length === 1 ? '' : 's'}${timed[0] ? `, first at ${T.clock(timed[0].start)}` : ''}.`;
   const lines = timed.map(e => `${T.clock(e.start)}–${T.clock(e.end)} ${e.title}${isHighStakes(e) ? ' ★' : ''}${e.meetLink ? ' (Meet)' : ''}`);
   const allDay = evs.filter(e => e.allDay).map(e => e.title);
   const notes = [];
@@ -69,7 +69,7 @@ export function briefing(kind = 'morning') {
   r.items.filter(x => x.kind !== 'task' && x.date > d).slice(0, 4).forEach(x => notes.push(`📌 ${x.title} — ${x.when}${x.time ? ' ' + x.time : ''}`));
   r.away.slice(0, 1).forEach(a => notes.push('✈️ ' + a.text));
   const text = [head, lines.length ? lines.join('\n') : 'Nothing scheduled.', notes.length ? notes.join('\n') : ''].filter(Boolean).join('\n\n');
-  const html = `<div style="font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;color:#1b2130;max-width:560px">
+  const html = `<div style="font:16px/1.5 'Times New Roman',Times,serif;color:#1b2130;max-width:560px">
 <p style="font-size:17px;margin:0 0 12px"><b>${esc(head)}</b></p>
 <table style="border-collapse:collapse;width:100%">${timed.map(e => `<tr><td style="padding:6px 10px 6px 0;color:#687087;white-space:nowrap;vertical-align:top">${T.clock(e.start)}–${T.clock(e.end)}</td><td style="padding:6px 0;border-bottom:1px solid #eef0f4">${esc(e.title)}${e.meetLink ? ` · <a href="${esc(e.meetLink)}">Join Meet</a>` : ''}${e.location && !e.meetLink ? `<br><span style="color:#687087;font-size:13px">${esc(e.location)}</span>` : ''}</td></tr>`).join('') || '<tr><td>Nothing scheduled.</td></tr>'}</table>
 ${notes.length ? `<ul style="padding-left:18px;margin:14px 0">${notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}

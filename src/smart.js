@@ -57,6 +57,7 @@ function avgEnergy(t, len, wake, sleep) {
  *   neighbors                     [{a, b, demand}] blocks already on the day
  *   same                          [{a, b}] other parts of the same item on this day
  *   brk                           break between blocks
+ *   rhythm                        24 score adjustments, one per hour, learned from what the user did (src/rhythm.js)
  */
 export function scoreSlot(t, len, c) {
   const { demand, wake, sleep } = c;
@@ -70,6 +71,8 @@ export function scoreSlot(t, len, c) {
     s += morning || evening ? 1.6 : t + len > sleep - 90 ? -1 : 0.4;
   } else if (demand === 'social') s += 1.2 * e;
   else s += e;
+
+  if (c.rhythm) s += rhythmAt(c.rhythm, t, len);
 
   if (c.ideal != null) s -= (c.idealWeight ?? 1.4) * Math.abs(t - c.ideal) / 60;
   if (c.from != null) s -= (c.earlyWeight ?? 0.08) * Math.max(0, t - c.from) / 60;
@@ -97,6 +100,14 @@ export function scoreSlot(t, len, c) {
   return s;
 }
 
+/** The learned adjustment for a block starting at minute t: the average over the hours it covers. */
+export function rhythmAt(rhythm, t, len) {
+  if (!rhythm) return 0;
+  let n = 0, sum = 0;
+  for (let m = t; m < t + len; m += 15) { sum += rhythm[Math.floor(m / 60) % 24] || 0; n++; }
+  return n ? sum / n : 0;
+}
+
 /** The free stretch around [t, t+len) given busy [a, b) ranges and a break, clipped to [lo, hi]. */
 export function freeAround(t, len, busy, brk, lo, hi) {
   let a = lo, b = hi;
@@ -108,7 +119,8 @@ export function freeAround(t, len, busy, brk, lo, hi) {
 }
 
 /** Why a slot was chosen, in a few words (shown to the model, which passes it on). */
-export function reasonFor(t, len, demand, wake, sleep) {
+export function reasonFor(t, len, demand, wake, sleep, rhythm = null) {
+  if (rhythmAt(rhythm, t, len) >= 0.3) return 'a time that has worked for you';
   const e = avgEnergy(t, len, wake, sleep);
   if (demand === 'deep') return e >= 0.95 ? 'peak focus hours' : e >= 0.8 ? 'good focus time' : 'best time left that day';
   if (demand === 'light') return 'lighter-energy time, keeps your peak free';

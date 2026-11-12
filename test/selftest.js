@@ -97,7 +97,7 @@ await test('create repeating (local) → delete whole series → undo brings it 
 });
 await test('explicit late-night time is allowed; auto placement respects meeting hours', async () => {
   cal.replaceAll(BASE);
-  beginRun('chat', 'gym kal raat 11 baje');
+  beginRun('chat', 'gym tomorrow at 11pm');
   const r = await TOOLS.create_event({ title: 'Gym', start: '2026-10-22T23:00', duration_minutes: 45, kind: 'personal', rationale: 'asked' });
   ok(r.ok);
   beginRun('chat', 'book a call with Raj tomorrow');
@@ -168,11 +168,19 @@ await test('short ids: model sees E-numbers, tools resolve them', async () => {
   eq(a, 'E1');
   eq(realId('e1'), 'very-long-google-id_20261021T100000Z');
 });
-await test('people: names resolve to remembered emails for invites + Meet', async () => {
+await test('people: invites go out only when asked; names resolve to remembered emails + Meet', async () => {
   cal.replaceAll(BASE);
   beginRun('chat', "riya's email is riya@college.edu");
   await TOOLS.remember_person({ name: 'Riya', email: 'riya@college.edu' });
-  beginRun('chat', 'book a call with riya and sam tomorrow at 3pm');
+  // Not asked to invite: booked for the user only, nobody is emailed, and the reply says how to send it.
+  beginRun('chat', 'book a call with riya tomorrow at 3pm');
+  const quiet = await TOOLS.create_event({ title: 'Call with Riya', start: '2026-10-22T15:00', duration_minutes: 30, kind: 'meeting', guests: 'Riya', rationale: 'asked' });
+  eq(quiet.invited, undefined);
+  ok(/invite Riya/.test(quiet.not_invited), quiet.not_invited);
+  eq(cal.get(realId(quiet.event.id)).guests, []);
+  eq(cal.get(realId(quiet.event.id)).meet, false);
+  cal.replaceAll(BASE);
+  beginRun('chat', 'book a call with riya and sam tomorrow at 3pm and invite them');
   const r = await TOOLS.create_event({ title: 'Call with Riya', start: '2026-10-22T15:00', duration_minutes: 30, kind: 'meeting', guests: 'Riya, Sam', rationale: 'asked' });
   eq(r.invited, ['riya@college.edu']);
   ok(/Sam/.test(r.not_invited));
@@ -236,9 +244,9 @@ await test('buffers around high-stakes events; agent blocks yield to new booking
 await test('agent: tool calls + finish in one turn → actions and a report', async () => {
   cal.replaceAll(BASE);
   const calls = fakeAi([{ calls: [['create_event', { title: 'Call with Rahul', start: '2026-10-22T15:00', duration_minutes: 30, kind: 'meeting', rationale: 'first free afternoon slot' }], ['finish', { report: 'Booked a call with Rahul tomorrow at 15:00.' }]] }]);
-  const out = await chat('Book a call with Rahul tomorrow at 3pm');
+  const out = await chat('Book a call with Rahul tomorrow afternoon');
   eq(calls.length, 1);
-  ok(/Booked/.test(out.reply));
+  ok(/Created "Call with Rahul"/.test(out.reply), out.reply);
   ok(out.actions.some(a => /Call with Rahul/.test(a.summary)));
   ok(/E\d+/.test(calls[0].messages.at(-1).content), 'context uses short ids');
 });
@@ -248,16 +256,16 @@ await test('agent: asking permission gets corrected into action', async () => {
     { text: 'Should I book it for 15:00?' },
     { calls: [['create_event', { title: 'Call with Rahul', start: '2026-10-22T15:00', duration_minutes: 30, kind: 'meeting', rationale: 'x' }], ['finish', { report: 'Booked it at 15:00.' }]] },
   ]);
-  const out = await chat('Book a call with Rahul tomorrow at 3pm');
+  const out = await chat('Book a call with Rahul tomorrow afternoon');
   eq(calls.length, 2);
-  ok(/AUTONOMY CHECK/.test(JSON.stringify(calls[1].messages)));
-  ok(/Booked/.test(out.reply));
+  ok(/asked permission/.test(JSON.stringify(calls[1].messages)));
+  ok(/Created "Call with Rahul"/.test(out.reply), out.reply);
 });
 await test('agent: false claim gets corrected', async () => {
   cal.replaceAll(BASE);
   const calls = fakeAi([{ text: 'I have cancelled the vendor sync.' }, { calls: [['delete_events', { event_ids: ['E3'], rationale: 'asked' }], ['finish', { report: 'Cancelled the vendor sync.' }]] }]);
-  await chat('Cancel the vendor sync');
-  ok(/CLAIM CHECK/.test(JSON.stringify(calls[1].messages)));
+  await chat('please get rid of the vendor sync');
+  ok(/no tool changed it/.test(JSON.stringify(calls[1].messages)));
 });
 await test('agent: greeting, thanks and undo need no model call', async () => {
   cal.replaceAll(BASE);
@@ -285,7 +293,7 @@ await test('agent: feedback "Bad" undoes and writes a rule', async () => {
 
 // ─── Model router ───
 await test('router: Workers AI out of allowance → Gemini answers, Workers AI skipped next time', async () => {
-  saveSettings({ geminiApiKey: 'test-key', aiOrder: ['workers-ai', 'gemini'] });
+  saveSettings({ geminiApiKey: 'test-key', aiOrder: ['workers-ai', 'gemini'], privateAi: false });
   let ai = 0, gem = 0;
   setAiBinding({ async run() { ai++; throw new Error('4006: you have used up your daily free allocation of 10,000 neurons'); } });
   useFetch(async url => {
@@ -307,7 +315,7 @@ await test('router: tool calls written as text by open models are recovered', as
   eq(r.calls[0].args.start_date, '2026-10-22');
 });
 await test('router: Gemini history keeps tool turns valid after a provider switch', async () => {
-  saveSettings({ geminiApiKey: 'k', aiOrder: ['gemini'] });
+  saveSettings({ geminiApiKey: 'k', aiOrder: ['gemini'], privateAi: false });
   let body;
   useFetch(async (url, opts) => { body = JSON.parse(opts.body); return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'ok' }] } }] })); });
   await generate({ system: 's', messages: [

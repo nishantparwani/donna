@@ -4,10 +4,12 @@
 import * as T from './time.js';
 import * as cal from './calendar.js';
 import { load, save, settings } from './store.js';
-import { RUN, TOOLS, isTimed, isAgentBlock, isHighStakes, isProtected, isPing, logAction, markWrite, ref } from './engine.js';
+import { RUN, TOOLS, isTimed, isAgentBlock, isHighStakes, isProtected, isPing, logAction, markWrite, ref, realId, awakeRanges, dayEndOn } from './engine.js';
 import { ensureRange } from './sync.js';
 import { syncGoals } from './goals.js';
+import { sameColor, relation, colorName } from './colors.js';
 import { demandOf, scoreSlot, freeAround, reasonFor } from './smart.js';
+import { rhythmBias, noteRhythm } from './rhythm.js';
 
 const TASK_HORIZON_DAYS = 14;
 const MIN_SESSION = 30;
@@ -178,7 +180,6 @@ function planTasks(s) {
   const issues = [];
   const store = load('tasks');
   const now = T.nowStr();
-  const lo = T.hm(s.dayStart), hi = T.hm(s.dayEnd);
   // 1. Bring each task's sessions up to date with the calendar.
   for (const t of store.items) {
     t.sessions = t.sessions || [];
@@ -211,7 +212,8 @@ function planTasks(s) {
   const open = store.items.filter(t => t.status === 'open').sort((a, b) => a.due.localeCompare(b.due) || PRIORITY[a.priority || 'normal'] - PRIORITY[b.priority || 'normal']);
   for (const t of open) {
     const minsOf = list => list.reduce((n, x) => n + T.diffMin(x.start, x.end), 0);
-    const done = minsOf(t.sessions.filter(x => x.end <= now));
+    // Past sessions count as done unless the user said they missed them; missed work is booked again.
+    const done = minsOf(t.sessions.filter(x => x.end <= now && !x.missed)) + (t.extraDone || 0);
     let need = t.minutes - done - minsOf(t.sessions.filter(x => x.end > now));
     t.spent = done;
     // Too much booked (the user shortened the task): release the latest sessions.
@@ -223,18 +225,22 @@ function planTasks(s) {
       t.sessions = t.sessions.filter(x => x !== last);
       need += T.diffMin(last.start, last.end);
     }
-    const due = t.due.length === 10 ? t.due + 'T' + s.dayEnd : t.due;
+    const due = t.due.length === 10 ? dayEndOn(t.due, s) : t.due;
     const maxSession = Math.max(MIN_SESSION, Number(t.sessionMinutes) || 90);
     const demand = demandOf(t.title, 'task');
     const last = [T.day(due), T.addDays(T.today(), TASK_HORIZON_DAYS)].sort()[0];
     const days = [];
-    for (let d = T.today(); d <= last; d = T.addDays(d, 1)) days.push(d);
+    // A goal's share for next week is worked on next week, not squeezed into this one.
+    for (let d = t.week && t.week > T.today() ? t.week : T.today(); d <= last; d = T.addDays(d, 1)) days.push(d);
     // Each session goes to the best (day, time) before the deadline, not the first free one: focus hours for
     // deep work, spread over days, a day of slack before it is due, light days before packed ones.
+    // Comfortable rules first (2 sessions a day, 90 min apart, a day of slack, ≤ 6h of focus a day); when the work
+    // doesn't fit that way the rules relax step by step, so a crunch gets booked instead of flagged as impossible.
+    let level = 0;
     while (need >= MIN_SESSION / 2) {
       const len = Math.max(MIN_SESSION, Math.min(maxSession, Math.ceil(need / 15) * 15));
-      const top = bestSession(t, days, len, due, demand, s);
-      if (!top) break;
+      const top = bestSession(t, days, len, due, demand, s, level);
+      if (!top) { if (level < RELAX.length - 1) { level++; continue; } break; }
       markWrite();
       const ev = cal.create({ title: `📝 ${t.title}`, start: top.st, end: T.addMin(top.st, top.len), kind: 'task', agent: true, taskId: t.id,
         description: `Work session for task ${t.id} (due ${T.human(due)}). Placed automatically; delete or move it freely and the plan adapts.` });
@@ -243,6 +249,7 @@ function planTasks(s) {
       need -= top.len;
     }
     t.atRisk = need >= MIN_SESSION / 2;
+    t.crunch = level > 0 || undefined;
     if (t.atRisk) issues.push(`Task ${t.id} "${t.title}" is at risk: ${Math.round(need)} of ${t.minutes} min could not be booked before it is due ${T.human(due)}.`);
   }
   save('tasks');
@@ -252,40 +259,60 @@ function planTasks(s) {
 /** Minutes of day d an event covers, clipped to the day. */
 const spanOn = (e, d) => [T.day(e.start) < d ? 0 : T.mins(e.start), T.day(e.end) > d ? 1440 : (T.mins(e.end) || 1440)];
 
+/**
+ * How strict placement is. Level 0 is how a sensible person plans a normal week; the next levels are what they
+ * do in a crunch: more sessions a day, shorter gaps, the deadline day and early hours allowed, a higher daily cap.
+ */
+const RELAX = [
+  { perDay: 2, gap: 90, dayCap: 360, slack: true, civil: true },
+  { perDay: 3, gap: 45, dayCap: 480, slack: false, civil: true },
+  { perDay: 6, gap: 15, dayCap: 600, slack: false, civil: false },
+];
+
 /** The best (day, start, length) for one more session of task t, or null if nothing fits before it is due. */
-function bestSession(t, days, len, due, demand, s) {
-  const lo = T.hm(s.dayStart), hi = T.hm(s.dayEnd) || 1440, civil = T.hm(s.workStart);
-  const lengths = [...new Set([len, Math.max(MIN_SESSION, len - 30), MIN_SESSION])].filter(n => n <= len);
+function bestSession(t, days, len, due, demand, s, level = 0) {
+  const rule = RELAX[level];
+  const wake = T.hm(s.dayStart), down = T.hm(s.dayEnd) > wake ? T.hm(s.dayEnd) : 1440, civil = T.hm(s.workStart);
+  // Sessions under 45 min are scraps for deep work: only the last level (a real crunch) may use them.
+  const shortest = level < RELAX.length - 1 && len >= 45 ? 45 : MIN_SESSION;
+  const lengths = [...new Set([len, Math.max(shortest, len - 30), Math.max(shortest, len - 45), shortest])].filter(n => n <= len);
+  const rhythm = rhythmBias(demand);
   let top = null;
   days.forEach((d, i) => {
     const mine = t.sessions.filter(x => T.day(x.start) === d);
-    if (mine.length >= 2) return;
-    const dayHi = T.day(due) === d ? Math.min(hi, T.mins(due)) : hi;
+    if (mine.length >= rule.perDay) return;
     const evs = dayEvents(d);
+    // Focus already booked that day (every task's sessions): no day gets more than the cap.
+    const focus = evs.filter(e => e.agent && (e.taskId || e.goalId)).reduce((n, e) => n + T.diffMin(e.start, e.end), 0);
+    if (focus + MIN_SESSION > rule.dayCap) return;
     const ranges = evs.map(e => spanOn(e, d));
     const neighbors = evs.map((e, k) => ({ a: ranges[k][0], b: ranges[k][1], demand: demandOf(e.title, e.kind) }));
-    const load = evs.filter(e => !isAgentBlock(e)).reduce((n, e) => { const [a, b] = spanOn(e, d); return n + Math.max(0, Math.min(b, hi) - Math.max(a, lo)); }, 0);
-    for (const n of lengths) {
-      for (const st of freeStarts(d, n, lo, dayHi)) {
-        if (mine.some(x => (st >= x.end ? T.diffMin(x.end, st) : T.diffMin(T.addMin(st, n), x.start)) < 90)) continue; // 90 min apart
-        const m = T.mins(st);
-        let sc = scoreSlot(m, n, { demand, wake: lo, sleep: hi, free: freeAround(m, n, ranges, 0, lo, dayHi), neighbors, brk: s.breakMinutes });
-        sc += 1.2 * n / len;                         // whole sessions beat stubs
-        sc -= 0.3 * i;                               // sooner is safer
-        if (d === T.day(due)) sc -= 1.2;             // keep a day of slack
-        if (mine.length) sc -= 1;                    // spread over days
-        if (m < civil && demand !== 'physical') sc -= 0.6; // civilised hours unless needed
-        sc -= Math.max(0, load - 6 * 60) / 60 * 0.25; // packed days get less
-        if (!top || sc > top.sc + 1e-9) top = { d, st, len: n, sc };
+    const load = evs.filter(e => !isAgentBlock(e)).reduce((n, e) => { const [a, b] = spanOn(e, d); return n + Math.max(0, Math.min(b, down) - Math.max(a, wake)); }, 0) + focus;
+    for (const [lo, hiRaw] of awakeRanges(s)) {
+      const hi = T.day(due) === d ? Math.min(hiRaw, T.mins(due)) : hiRaw;
+      for (const n of lengths) {
+        if (focus + n > rule.dayCap) continue;
+        for (const st of freeStarts(d, n, lo, hi)) {
+          if (mine.some(x => (st >= x.end ? T.diffMin(x.end, st) : T.diffMin(T.addMin(st, n), x.start)) < rule.gap)) continue;
+          const m = T.mins(st);
+          let sc = scoreSlot(m < wake ? m + 1440 : m, n, { demand, wake, sleep: down + (down === 1440 ? T.hm(s.dayEnd) : 0), free: freeAround(m, n, ranges, 0, lo, hi), neighbors, brk: s.breakMinutes, rhythm });
+          sc += 1.2 * n / len;                         // whole sessions beat stubs
+          sc -= 0.3 * i;                               // sooner is safer
+          if (d === T.day(due) && rule.slack) sc -= 1.2; // keep a day of slack
+          if (mine.length) sc -= 1;                    // spread over days
+          if (m < civil && m >= wake && demand !== 'physical' && rule.civil) sc -= 0.6; // civilised hours unless needed
+          sc -= Math.max(0, load - 6 * 60) / 60 * 0.25; // packed days get less
+          if (!top || sc > top.sc + 1e-9) top = { d, st, len: n, sc };
+        }
       }
     }
   });
-  if (top) top.why = `${top.d === T.today() ? 'today' : T.DAY_NAMES[T.dow(top.d)]}, ${reasonFor(T.mins(top.st), top.len, demand, lo, hi)}`;
+  if (top) top.why = `${top.d === T.today() ? 'today' : T.DAY_NAMES[T.dow(top.d)]}, ${level ? 'tight deadline, ' : ''}${reasonFor(T.mins(top.st), top.len, demand, wake, down, rhythm)}`;
   return top;
 }
 
 // ─── Task & habit tools (model-facing; declared in engine.TOOL_DECLS) ───
-const taskView = t => ({ id: t.id, title: t.title, minutes: t.minutes, spent: t.spent || 0, due: t.due, priority: t.priority, status: t.status, atRisk: t.atRisk || undefined,
+const taskView = t => ({ id: t.id, title: t.title, week: t.week, goalId: t.goalId, minutes: t.minutes, spent: t.spent || 0, due: t.due, priority: t.priority, status: t.status, atRisk: t.atRisk || undefined, crunch: t.crunch || undefined, booked: (t.sessions || []).filter(x => x.end > T.nowStr()).reduce((n, x) => n + T.diffMin(x.start, x.end), 0),
   sessions: (t.sessions || []).filter(x => x.end > T.nowStr()).map(x => `${T.human(x.start)}–${T.clock(x.end)}`) });
 
 function normDue(due) {
@@ -294,7 +321,51 @@ function normDue(due) {
   return T.norm(s);
 }
 
+/** Work sessions that have ended and that the user hasn't checked in on yet (newest first). */
+export function sessionsToConfirm(sinceHours = 36) {
+  const now = T.nowStr(), from = T.addMin(now, -sinceHours * 60);
+  const out = [];
+  for (const t of load('tasks').items) {
+    if (t.status === 'deleted' || t.goalId) continue;
+    for (const x of t.sessions || []) if (x.end <= now && x.end >= from && !x.missed && !x.done) out.push({ eventId: x.eventId, taskId: t.id, title: t.title, start: x.start, end: x.end });
+  }
+  return out.sort((a, b) => b.start.localeCompare(a.start));
+}
+
 Object.assign(TOOLS, {
+  /** "I skipped the OS session" / Today's Done · Missed buttons. Missed work is booked again before the deadline. */
+  async session_status(a) {
+    const id = String(a.event_id || '').trim();
+    const status = a.status === 'missed' ? 'missed' : a.status === 'partial' ? 'partial' : 'done';
+    const store = load('tasks');
+    let task = null, ses = null;
+    for (const t of store.items) {
+      const x = (t.sessions || []).find(y => y.eventId === id || y.eventId === realId(id));
+      if (x) { task = t; ses = x; break; }
+    }
+    // The model may name the task instead: its latest session that has ended.
+    if (!ses && a.task_id) {
+      task = store.items.find(t => t.id.toLowerCase() === String(a.task_id).toLowerCase());
+      ses = task && (task.sessions || []).filter(x => x.end <= T.nowStr()).sort((x, y) => y.start.localeCompare(x.start))[0];
+    }
+    if (!ses) throw new Error('No finished work session matches. Sessions only count once they have ended.');
+    // The first verdict on a session is evidence about that hour of the day (src/rhythm.js).
+    const fresh = !ses.missed && !ses.done, demand = demandOf(task.title, 'task'), total = T.diffMin(ses.start, ses.end);
+    if (status === 'partial') {
+      const m = Math.max(0, Math.min(total, Number(a.minutes_done) || 0)); ses.missed = true; task.extraDone = (task.extraDone || 0) + m;
+      if (fresh && total) { noteRhythm(true, demand, ses.start, ses.end, m / total); noteRhythm(false, demand, ses.start, ses.end, 1 - m / total); }
+    } else {
+      ses.missed = status === 'missed'; ses.done = status === 'done';
+      if (fresh) noteRhythm(status === 'done', demand, ses.start, ses.end);
+    }
+    save('tasks');
+    RUN.planNeeded = true;
+    await plan();
+    const t = load('tasks').items.find(x => x.id === task.id);
+    const next = (t.sessions || []).filter(x => x.start > T.nowStr()).sort((x, y) => x.start.localeCompare(y.start))[0];
+    return { ok: true, result: status === 'done' ? `Marked "${t.title}" session as done.` : `Noted. The missed time for "${t.title}" is booked again${next ? `, next session ${T.human(next.start)}` : ''}${t.atRisk ? ' (but it no longer all fits before the deadline)' : ''}.` };
+  },
+
   async add_task(a) {
     const minutes = Math.round(Number(a.minutes));
     if (!(minutes >= 15 && minutes <= 60 * 40)) throw new Error('minutes must be between 15 and 2400.');
@@ -366,9 +437,43 @@ export function findConflicts(d) {
       if (real[j].end <= T.nowStr()) continue;
       if (real[i].readOnly && real[j].readOnly) continue;
       const a = real[i], b = real[j];
+      if (sameColor(a, b)) continue; // same colour = simultaneous on purpose
       const movable = [a, b].some(e => e.organizer && !e.readOnly && !isProtected(e));
-      out.push(`Conflict on ${d}: ${ref(a.id)} "${a.title}" ${T.clock(a.start)}–${T.clock(a.end)} overlaps ${ref(b.id)} "${b.title}" ${T.clock(b.start)}–${T.clock(b.end)}${movable ? '' : ' (neither can be moved automatically)'}.`);
+      const rel = relation(a, b);
+      const lower = rel === 'higher' ? b : rel === 'lower' ? a : null;
+      out.push(`Conflict on ${d}: ${ref(a.id)} "${a.title}" ${T.clock(a.start)}–${T.clock(a.end)} overlaps ${ref(b.id)} "${b.title}" ${T.clock(b.start)}–${T.clock(b.end)}${lower ? ` (lower priority: "${lower.title}", ${colorName(lower.color)})` : ''}${movable ? '' : ' (neither can be moved automatically)'}.`);
     }
+  }
+  return out;
+}
+
+/**
+ * The next 7 days at a glance: hours already committed, focus Donna booked, what is left free, and deadlines.
+ * Days where most waking hours are spoken for are marked heavy so the user sees an overload before it happens.
+ */
+export function weekLoad(days = 7) {
+  const s = settings();
+  const tasks = load('tasks').items.filter(t => t.status === 'open');
+  const out = [];
+  for (let i = 0; i < days; i++) {
+    const d = T.addDays(T.today(), i);
+    let busyMin = 0, focusMin = 0, habitMin = 0, awake = 0;
+    const evs = dayEvents(d).filter(e => e.kind !== 'buffer' && !isPing(e));
+    for (const [lo, hi] of awakeRanges(s)) {
+      awake += hi - lo;
+      for (const e of evs) {
+        const [a, b] = spanOn(e, d);
+        const m = Math.max(0, Math.min(b, hi) - Math.max(a, lo));
+        if (!m) continue;
+        if (e.agent && (e.taskId || e.goalId)) focusMin += m;
+        else if (e.agent && e.habitId) habitMin += m;
+        else busyMin += m;
+      }
+    }
+    const due = tasks.filter(t => T.day(t.due) === d).map(t => ({ id: t.id, title: t.title.replace(/ \(weekly goal\)$/, ''), atRisk: !!t.atRisk }));
+    const total = busyMin + focusMin + habitMin;
+    // Heavy = most of the waking day is spoken for, or less than 3 free hours are left.
+    out.push({ date: d, busy: busyMin, focus: focusMin, habits: habitMin, free: Math.max(0, awake - total), awake, due, heavy: total > awake * 0.7 || awake - total < 180 });
   }
   return out;
 }

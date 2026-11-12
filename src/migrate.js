@@ -16,6 +16,9 @@ export function migrate() {
   if ((st.schema || 1) < 3) changed = toV3(st) || changed;
   if ((st.schema || 1) < 4) changed = toV4(st) || changed;
   if ((st.schema || 1) < 5) changed = toV5(st) || changed;
+  if ((st.schema || 1) < 6) changed = toV6(st) || changed;
+  if ((st.schema || 1) < 7) changed = toV7(st) || changed;
+  if ((st.schema || 1) < 8) changed = toV8(st) || changed;
   return changed;
 }
 
@@ -140,5 +143,43 @@ function toV5(st) {
   const c = load('chat');
   c.messages.push({ role: 'assistant', time: T.nowStr(), actions: [], text: '🤖 Autonomy is on. Every 15 minutes I keep task sessions, habits and buffers in place and fix clashes, and when you open the app after 6 pm I get tomorrow ready on my own. Everything I decide shows on the Today screen with an Undo button.' });
   save('chat');
+  return true;
+}
+
+// v6: a stronger model answers first (gpt-oss-120b on Cloudflare: 95-scenario eval, ~3 s a reply), Gemini is the
+// fallback; and the old upgrade announcements leave the conversation.
+const OLD_WORKERS_MODELS = ['@cf/qwen/qwen3-30b-a3b-fp8', '@cf/meta/llama-3.3-70b-instruct-fp8-fast', ''];
+function toV6(st) {
+  const s = load('settings');
+  if (OLD_WORKERS_MODELS.includes(s.workersAiModel || '')) s.workersAiModel = DEFAULT_SETTINGS.workersAiModel;
+  const order = Array.isArray(s.aiOrder) && s.aiOrder.length ? s.aiOrder : DEFAULT_SETTINGS.aiOrder;
+  s.aiOrder = ['workers-ai', ...order.filter(p => p !== 'workers-ai')];
+  save('settings');
+  const c = load('chat');
+  c.messages = c.messages.filter(m => !(m.role === 'assistant' && /^(🚀 Upgraded to|🤖 Autonomy is on.|✨ (?:New|Upgraded))/.test(m.text || '')));
+  save('chat');
+  st.schema = 6; save('state');
+  return true;
+}
+
+// v7: the v2 announcement ("🎉 I've been upgraded") goes too; v6 only knew the later ones.
+function toV7(st) {
+  const c = load('chat');
+  const n = c.messages.length;
+  c.messages = c.messages.filter(m => !(m.role === 'assistant' && /^(🎉 I've been upgraded|🚀 Upgraded to|🤖 Autonomy is on)/.test(m.text || '')));
+  if (c.messages.length !== n) save('chat');
+  st.schema = 7; save('state');
+  return true;
+}
+
+/** v8: the WhatsApp channel is gone. Its settings, message ids and "via" tags are removed (its keys leave the vault in store.js). */
+function toV8(st) {
+  const s = load('settings');
+  for (const k of Object.keys(s)) if (/^whatsapp/i.test(k)) delete s[k];
+  save('settings');
+  const c = load('chat');
+  if (c.messages.some(m => m.via)) { for (const m of c.messages) delete m.via; save('chat'); }
+  delete st.waSeen;
+  st.schema = 8; save('state');
   return true;
 }

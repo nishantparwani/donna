@@ -20,7 +20,7 @@ const ICON = {
   chat: '<svg class="i" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L3 21l1.9-5.4A8 8 0 1 1 21 12z"/></svg>',
   check: '<svg class="i" viewBox="0 0 24 24" style="width:13px;height:13px"><path d="M5 12l5 5 9-10"/></svg>',
   warn: '<svg class="i" viewBox="0 0 24 24"><path d="M12 3l10 18H2L12 3zM12 10v4M12 17.5v.5"/></svg>',
-  spark: '<svg class="i" viewBox="0 0 24 24"><path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"/></svg>',
+  spark: '<svg class="i" viewBox="0 0 24 24"><path d="M4 20l4-1 11-11-3-3L5 16l-1 4zM14 7l3 3"/></svg>',
   play: '<svg class="i" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></svg>',
   copy: '<svg class="i" viewBox="0 0 24 24"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>',
 };
@@ -64,10 +64,15 @@ const diff = (a, b) => (new Date(b) - new Date(a)) / 60000;
 const addMin = (s, n) => { const x = new Date(s); x.setMinutes(x.getMinutes() + n); return `${ymd(x)}T${p2(x.getHours())}:${p2(x.getMinutes())}`; };
 const dur = m => m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? ' ' + (m % 60) + 'm' : ''}` : `${m}m`;
 const relDay = (d, today) => d === today ? 'Today' : d === addDays(today, 1) ? 'Tomorrow' : d === addDays(today, -1) ? 'Yesterday' : dayLabel(d);
-const md = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">link</a>')
+const md = s => esc(String(s || "").replace(/^(?:🤖|📅|☀️|🌙)\s*/u, "")).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">link</a>')
   .split(/\n{2,}/).map(par => {
     const lines = par.split('\n');
     if (lines.every(l => /^\s*[-•]\s/.test(l))) return `<ul>${lines.map(l => `<li>${l.replace(/^\s*[-•]\s/, '')}</li>`).join('')}</ul>`;
+    // An agenda ("11:00–12:00 AI Lecture" per line, maybe under a heading) reads as a time table.
+    const TL = /^\s*(?:[-•]\s*)?((?:\d{1,2}:\d{2})\s*[–-]\s*(?:\d{1,2}:\d{2})|All day)\s+(.+)$/;
+    if (lines.filter(l => TL.test(l)).length >= 2 && lines.every((l, i) => TL.test(l) || (i === 0 && /:\s*$/.test(l)))) {
+      return (TL.test(lines[0]) ? '' : `<p class="agh">${lines[0].replace(/:\s*$/, '')}</p>`) + `<div class="agl">${lines.filter(l => TL.test(l)).map(l => { const [, t, x] = TL.exec(l); return `<div><span>${t}</span><b>${x}</b></div>`; }).join('')}</div>`;
+    }
     return `<p>${lines.join('<br>')}</p>`;
   }).join('');
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
@@ -91,7 +96,7 @@ const S = {
 };
 
 // ─── Navigation ───
-const TITLES = { today: 'Today', calendar: 'Calendar', tasks: 'Tasks', habits: 'Habits', insights: 'Insights', activity: 'Activity', memory: 'Memory', settings: 'Settings', more: 'More' };
+const TITLES = { today: 'Today', calendar: 'Calendar', tasks: 'Tasks', reminders: 'Reminders', habits: 'Habits', insights: 'Insights', activity: 'Activity', memory: 'Memory', settings: 'Settings', more: 'More' };
 function setView(v, { push = true } = {}) {
   if (v === 'chat') { $('app').classList.add('mobile-chat'); setTab('chat'); $('input').focus(); return; }
   $('app').classList.remove('mobile-chat');
@@ -100,6 +105,9 @@ function setView(v, { push = true } = {}) {
   setTab(v);
   if (push) history.replaceState(null, '', '#' + v);
   document.title = `${TITLES[v] || 'Donna'} · ${S.settings.agentName || 'Donna'}`;
+  const view = $('view');
+  view.classList.remove('enter'); void view.offsetWidth; view.classList.add('enter');
+  clearTimeout(setView.t); setView.t = setTimeout(() => view.classList.remove('enter'), 900);
   render();
 }
 function setTab(v) { document.querySelectorAll('#tabbar button').forEach(b => b.classList.toggle('on', b.dataset.view === v || (v !== 'today' && v !== 'calendar' && v !== 'chat' && v !== 'tasks' && b.dataset.view === 'more'))); }
@@ -107,14 +115,21 @@ document.querySelectorAll('#nav button, #tabbar button').forEach(b => b.onclick 
 window.addEventListener('hashchange', () => { const v = location.hash.slice(1); if (TITLES[v] && v !== S.view) setView(v, { push: false }); });
 
 function render() {
-  const fn = { today: renderToday, calendar: renderCalendar, tasks: renderTasks, habits: renderHabits, insights: renderInsights, activity: renderActivity, memory: renderMemory, settings: renderSettings, more: renderMore }[S.view];
+  const fn = { today: renderToday, calendar: renderCalendar, tasks: renderTasks, reminders: renderReminders, habits: renderHabits, insights: renderInsights, activity: renderActivity, memory: renderMemory, settings: renderSettings, more: renderMore }[S.view];
   closePop();
   fn().catch(e => {
     // Something is already on screen (the saved copy): keep it and say what went wrong.
-    if ($('view').querySelector('.hero, #calBody, .card')) return toast('⚠️ ' + e.message, { ms: 6000 });
+    if ($('view').querySelector('.hero, #calBody, .card')) return toast(e.message, { ms: 6000 });
     $('view').innerHTML = `<div class="view pad"><div class="banner warn">${ICON.warn}<div>${esc(e.message)}</div></div></div>`; });
 }
-function topbar(html) { $('topbar').innerHTML = html + '<span class="syncpill" id="syncPill" title="When your calendar was last read from Google"></span>'; paintSync(); }
+function topbar(html) {
+  const ask = `<button class="askbar hide-m" id="askBar" title="Ask ${esc(S.settings.agentName || 'Donna')} from anywhere">${ICON.spark}<span>Ask ${esc(S.settings.agentName || 'Donna')} to do anything…</span><span class="kbd">Ctrl K</span></button>`;
+  const i = html.indexOf('<span class="spacer"></span>');
+  $('topbar').innerHTML = (i < 0 ? html + ask : html.slice(0, i) + '<span class="spacer"></span>' + ask + '<span class="spacer"></span>' + html.slice(i + 28)) +
+    '<span class="syncpill" id="syncPill" title="When your calendar was last read from Google"></span>';
+  $('askBar').onclick = () => openCmdk();
+  paintSync();
+}
 
 // ─── Google sync: views come from the saved copy instantly; this checks Google in the background ───
 const SYNC = { at: null, busy: false, tried: 0, failed: false };
@@ -200,23 +215,27 @@ async function loadState(view, date) {
 // ─── Today ───
 async function renderToday() {
   topbar(`<h1>Today</h1><span class="muted hide-m">${dayLabel(S.today, true)}</span><span class="spacer"></span>
-    <button class="btn" id="imUp" title="Re-plan the rest of today from now">☀️<span class="hide-m">I'm up</span></button>
+    <button class="btn" id="imUp" title="Re-plan the rest of today from now"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><span class="hide-m hide-n">I'm up</span></button>
+    <button class="btn" id="planWeek" title="Deadlines, weekly goals and habits for the week">${ICON.cal}<span class="hide-m">Plan my week</span></button>
     <button class="btn" id="planDay" title="Build a plan for a day">${ICON.spark}<span class="hide-m">Plan my day</span></button>
     <button class="btn primary" id="newEv">${ICON.plus}<span class="hide-m">New event</span></button>`);
   $('imUp').onclick = () => ask('I woke up just now, replan my day');
   $('planDay').onclick = () => openPlanner();
+  $('planWeek').onclick = () => openWeekPlanner();
   $('newEv').onclick = () => openEditor({ start: roundNow(), end: addMin(roundNow(), 30), kind: 'meeting' });
   // Paint what was last seen right away; fresh data replaces it a moment later.
   const last = snap.get('today');
-  if (last && last.st.today === S.today && !$('view').querySelector('.hero')) { try { setStatus(last.st.settings); paintToday(last.st, last.tm, last.rd, last.decisions, last.autoPlan, last.ledger); } catch { /* old shape */ } }
+  if (last && last.st.today === S.today && !$('view').querySelector('.hero')) { try { setStatus(last.st.settings); paintToday(last.st, last.tm, last.rd, last.decisions, last.autoPlan, last.ledger, last.extra || {}); } catch { /* old shape */ } }
   else if (!last) $('view').innerHTML = '<div class="view pad"><div class="wrap"><div class="skeleton"></div><div class="skeleton"></div></div></div>';
-  const { st, tm, rd, decisions, autoPlan, ledger } = await api('/api/home');
+  const { st, tm, rd, decisions, autoPlan, ledger, checkin, week, reminders, rhythm } = await api('/api/home');
+  const extra = { checkin: checkin || [], week: week || [], reminders: reminders || [], lean: focusLean(rhythm) };
   S.today = st.today;
   setStatus(st.settings);
   $('taskCount').textContent = st.tasks.length || '';
-  snap.set('today', { st, tm, rd, decisions, autoPlan, ledger });
+  $('remCount').textContent = extra.reminders.length || '';
+  snap.set('today', { st, tm, rd, decisions, autoPlan, ledger, extra });
   if (S.view !== 'today') return;
-  paintToday(st, tm, rd, decisions, autoPlan, ledger);
+  paintToday(st, tm, rd, decisions, autoPlan, ledger, extra);
   noteSync(st.sync);
   if (autoPlan && autoPlan.on && autoPlan.target && !autoPlan.done) planAhead(autoPlan.target);
 }
@@ -233,12 +252,21 @@ async function planAhead(target) {
     store.set('autoPlanned', target);
     if (!r.skipped) toast(r.changes ? `Tomorrow is ready: ${r.changes} change${r.changes === 1 ? '' : 's'}. See “${S.settings.agentName || 'Donna'} decided”.` : 'Tomorrow already fits. Nothing needed changing.', { ms: 6000 });
     loadChat().catch(() => {});
-  } catch (err) { toast('⚠️ Could not plan tomorrow: ' + err.message); }
+  } catch (err) { toast('Could not plan tomorrow: ' + err.message); }
   planningAhead = false;
   if (S.view === 'today') render();
 }
-// Your alertness through the day (same curve the planner uses, src/smart.js), from your own wake-up / wind-down.
+// What the planner has learned about your focus hours (src/rhythm.js): 24 adjustments, or null while it has nothing to go on.
+let LEAN = null;
+const focusLean = r => { const k = r && (r.kinds || []).find(x => x.id === 'deep' && x.ready); return k && k.hours.some(h => h.lean) ? k.hours.map(h => h.lean) : null; };
+// Your alertness through the day (same curve the planner uses, src/smart.js), from your own wake-up / wind-down,
+// shifted by what you actually finished and missed at each hour once there is enough of it.
 function energyAt(m, wake, sleep) {
+  const base = baseEnergy(m, wake, sleep);
+  if (!LEAN || base <= 0.15) return base;
+  return Math.max(0.2, Math.min(1, base + (LEAN[Math.floor(m / 60) % 24] || 0) / 3));
+}
+function baseEnergy(m, wake, sleep) {
   if (sleep <= wake) sleep = 1440;
   if (m < wake || m >= sleep) return 0.15;
   const since = m - wake, dip = Math.max(13 * 60 + 30, wake + 5 * 60);
@@ -259,14 +287,14 @@ const inMin = (from, to) => { const m = Math.round(diff(from, to)); return m < 6
 
 /** Your waking day as one strip: energy shading behind, your blocks on top, a marker for now. */
 function dayStrip(st, s) {
-  const wake = hm(s.dayStart || '07:00'), sleep = hm(s.dayEnd || '23:00') || 1440;
+  const wake = hm(s.dayStart || '07:00'), sleep = hm(s.dayEnd || '23:00') > wake ? hm(s.dayEnd || '23:00') : 1440;
   const span = Math.max(60, sleep - wake), pct = m => Math.max(0, Math.min(100, (m - wake) / span * 100));
   let shade = '';
   for (let m = wake; m < sleep; m += 30) shade += `<i style="left:${pct(m)}%;width:${30 / span * 100}%;opacity:${(energyAt(m + 15, wake, sleep) * .9).toFixed(2)}"></i>`;
   const blocks = st.events.filter(e => !e.allDay && e.kind !== 'buffer' && e.myStatus !== 'declined').map(e => {
     const a = e.start.slice(0, 10) < S.today ? wake : mins(e.start), b = e.end.slice(0, 10) > S.today ? sleep : mins(e.end);
     if (b <= wake || a >= sleep) return '';
-    return `<b class="k-${e.readOnly ? 'busy' : e.category} ${e.origin === 'auto' ? 'by-auto' : ''}" style="left:${pct(a)}%;width:${Math.max(.6, pct(b) - pct(a))}%" title="${esc(clock(e.start) + ' ' + e.title)}"></b>`;
+    return `<b class="k-${e.readOnly ? 'busy' : e.category} ${e.origin === 'auto' ? 'by-auto' : ''}" style="left:${pct(a)}%;width:${Math.max(.6, pct(b) - pct(a))}%;${e.paint ? `--cc:${e.paint}` : ""}" title="${esc(clock(e.start) + ' ' + e.title)}"></b>`;
   }).join('');
   const now = mins(st.now);
   const peakFrom = wake + 45, peakTo = Math.min(wake + 255, Math.max(13 * 60 + 30, wake + 300));
@@ -274,7 +302,7 @@ function dayStrip(st, s) {
   return `<div class="strip" aria-label="Your day from ${s.dayStart} to ${s.dayEnd}">
     <div class="strip-bar"><div class="shade">${shade}</div>${blocks}${now > wake && now < sleep ? `<span class="strip-now" style="left:${pct(now)}%"></span>` : ''}</div>
     <div class="strip-ticks">${ticks.map(t => `<span style="left:${pct(t)}%">${hhmm(Math.min(t, 1439))}</span>`).join('')}</div>
-    <div class="strip-legend"><span><i class="sw energy"></i>your energy (peak ${hhmm(peakFrom)}–${hhmm(peakTo)}, from your ${esc(s.dayStart)} wake-up)</span><span><i class="sw auto"></i>placed by ${esc(s.agentName || 'Donna')}</span></div>
+    <div class="strip-legend"><span><i class="sw energy"></i>${LEAN ? 'your focus hours, from what you finished and missed (Memory → Your hours)' : `your energy (peak ${hhmm(peakFrom)}–${hhmm(peakTo)}, from your ${esc(s.dayStart)} wake-up)`}</span><span><i class="sw auto"></i>placed by ${esc(s.agentName || 'Donna')}</span></div>
   </div>`;
 }
 
@@ -286,9 +314,9 @@ function trustCard(list, autoPlan, led) {
   const row = d => `<div class="issue decision ${d.undone ? 'undone' : ''}">
       <span class="muted mono" style="font-size:12px;min-width:44px">${esc(clock(d.time))}</span>
       <span style="flex:1;min-width:0">${esc(d.summary)}${d.why ? `<div class="hint">Why: ${esc(d.why)}</div>` : ''}
-      ${d.undone ? '<span class="pill">undone</span>' : d.kept ? '<span class="pill ok">kept</span>' : `<span class="dec-btns"><button class="btn sm" data-keep="${esc(d.id)}" title="Good call: keep it and do more like this">👍 Keep</button><button class="btn sm ghost" data-undo="${esc(d.id)}">↩ Undo</button></span>`}</span></div>`;
+      ${d.undone ? '<span class="pill">undone</span>' : d.kept ? '<span class="pill ok">kept</span>' : `<span class="dec-btns"><button class="btn sm" data-keep="${esc(d.id)}" title="Good call: keep it and do more like this">Keep</button><button class="btn sm ghost" data-undo="${esc(d.id)}">Undo</button></span>`}</span></div>`;
   const plan = !on ? '' : autoPlan && autoPlan.done ? `Tomorrow planned at ${esc(clock(autoPlan.at || ''))}.` : new Date().getHours() >= 18 ? 'Planning tomorrow…' : 'Plans tomorrow when you open the app after 6 pm.';
-  return `<div class="card trust"><h2>🤝 Your call<span class="hint">${open.length ? `${open.length} to review` : 'all reviewed'}</span></h2>
+  return `<div class="card trust"><h2>${ICON.spark} ${name}'s changes<span class="hint">${open.length ? `${open.length} to review` : 'all reviewed'}</span></h2>
     <div class="autopilot ${on ? 'on' : ''}">
       <div style="flex:1"><b>Autopilot ${on ? 'on' : 'off'}</b><div class="hint">${on ? `${name} keeps tasks, habits and buffers in place and fixes clashes. ${plan}` : `${name} only acts when you ask.`}</div></div>
       <button class="btn sm ${on ? '' : 'primary'}" id="autopilot">${on ? 'Pause' : 'Turn on'}</button></div>
@@ -299,12 +327,133 @@ function trustCard(list, autoPlan, led) {
   </div>`;
 }
 
-function paintToday(st, tm, rd, decisions = [], autoPlan = null, led = null) {
+/** "Did you do it?" for work sessions that just ended: Missed puts the time back into the plan. */
+function checkinCard(list) {
+  if (!list.length) return '';
+  return `<div class="card checkin"><h2>${ICON.check} Did you do these?<span class="hint">missed = re-booked</span></h2>
+    ${list.slice(0, 4).map(x => `<div class="ci" data-ev="${esc(x.eventId)}"><div style="flex:1;min-width:0"><div class="ttl">${esc(x.title)}</div><div class="hint">${esc(relDay(x.start.slice(0, 10), S.today))} · ${clock(x.start)}–${clock(x.end)}</div></div>
+      <button class="btn sm" data-ci="done">${ICON.check} Done</button><button class="btn sm ghost" data-ci="missed">Missed</button></div>`).join('')}</div>`;
+}
+/** The next 7 days as stacked bars: classes & meetings, focus Donna booked, habits, and what's left free. */
+function weekCard(week) {
+  if (!week.length) return '';
+  const max = Math.max(...week.map(d => d.awake), 1);
+  const col = d => {
+    const pct = m => (m / max * 100).toFixed(1) + '%';
+    const used = d.busy + d.focus + d.habits;
+    return `<button class="wk-day ${d.heavy ? 'heavy' : ''} ${d.date === S.today ? 'today' : ''}" data-day="${esc(d.date)}" title="${esc(dayLabel(d.date, true))}: ${dur(d.busy)} commitments · ${dur(d.focus)} focus · ${dur(d.habits)} habits · ${dur(d.free)} free">
+      <div class="wk-bar"><i class="b-free" style="height:${pct(d.free)}"></i><i class="b-habits" style="height:${pct(d.habits)}"></i><i class="b-focus" style="height:${pct(d.focus)}"></i><i class="b-busy" style="height:${pct(d.busy)}"></i></div>
+      <div class="wk-lab">${d.date === S.today ? 'Today' : DAYS[dow(d.date)]}<b>${dur(used)}</b></div>
+      ${d.due.length ? `<div class="wk-due ${d.due.some(x => x.atRisk) ? 'risk' : ''}" title="Due: ${esc(d.due.map(x => x.title).join(', '))}">${d.due.length} due</div>` : '<div class="wk-due none"></div>'}
+    </button>`;
+  };
+  const focus = week.reduce((n, d) => n + d.focus, 0), heavy = week.filter(d => d.heavy).length;
+  return `<div class="card week"><h2>${ICON.cal} Your week<span class="hint">${dur(focus)} of focus booked${heavy ? ` · <span class="bad-t">${heavy} heavy day${heavy > 1 ? 's' : ''}</span>` : ''}</span></h2>
+    <div class="wk">${week.map(col).join('')}</div>
+    <div class="wk-legend"><span><i class="b-busy"></i>classes & meetings</span><span><i class="b-focus"></i>focus Donna booked</span><span><i class="b-habits"></i>habits</span><span><i class="b-free"></i>free</span></div></div>`;
+}
+// ─── The ticker: your reminders, each followed by an affirmation ───
+const AFFIRMATIONS = [
+  "You don't have to do it all today. Just the next thing.",
+  'Done is better than perfect.',
+  'Small steps still count.',
+  "You've handled hard weeks before.",
+  'Rest is part of the work.',
+  'Start messy. Fix it later.',
+  'Consistency beats intensity.',
+  'Your pace is fine.',
+  'One block at a time.',
+  'Focus on what you can control.',
+  'Progress, not perfection.',
+  'Be as kind to yourself as you would be to a friend.',
+];
+const dayOfYear = d => Math.round((new Date(d + 'T12:00') - new Date(d.slice(0, 4) + '-01-01T12:00')) / 864e5) + 1;
+/** Reminder, affirmation, reminder, affirmation… scrolling across; hover or focus pauses it. */
+function ticker(reminders, s) {
+  const own = String(s.affirmations || '').split('\n').map(x => x.trim()).filter(Boolean);
+  const aff = own.length ? own : AFFIRMATIONS;
+  const off = dayOfYear(S.today);
+  const n = reminders.length;
+  const items = [];
+  // Every reminder once, each followed by an affirmation; with no reminders, three affirmations.
+  for (let i = 0; i < (n || 3); i++) {
+    if (n) items.push(`<a class="tk rem" href="#reminders" title="Open reminders"><span class="tk-k">Remember</span>${esc(reminders[i].text)}</a>`);
+    items.push(`<span class="tk aff">${esc(aff[(off + i) % aff.length])}</span>`);
+  }
+  // Each half must be wider than the screen for the loop to be seamless.
+  const one = items.join(''), oneChars = one.replace(/<[^>]+>/g, '').length;
+  let run = one, chars = oneChars;
+  while (chars < 220) { run += one; chars += oneChars; }
+  const secs = Math.max(28, Math.round(chars * 0.24));
+  return `<div class="ticker" aria-label="Reminders and affirmations"><div class="ticker-track" style="--dur:${secs}s"><div class="ticker-run">${run}</div><div class="ticker-run" aria-hidden="true">${run.replace(/<a /g, '<a tabindex="-1" ')}</div></div></div>`;
+}
+/** Reminders on Today: tick off, or add one in place. */
+function remindersCard(list) {
+  return `<div class="card rems"><h2>Reminders<span class="hint"><a href="#reminders">${list.length ? 'All ' + list.length : 'Open'}</a></span></h2>
+    <div class="list">${list.slice(0, 5).map(remRow).join('') || '<div class="hint" style="padding:4px 0 8px">Things without a date go here, e.g. “renew passport”.</div>'}</div>
+    <form class="rem-add" data-remadd><input name="text" placeholder="Add a reminder…" autocomplete="off" maxlength="200" aria-label="New reminder"><button class="btn sm">Add</button></form></div>`;
+}
+function remRow(r) {
+  return `<div class="li rem ${r.done ? 'done' : ''}" data-rem="${esc(r.id)}">
+    <button class="circle ${r.done ? 'on' : ''}" data-remdone="${esc(r.id)}" title="${r.done ? 'Not done' : 'Done'}">${r.done ? ICON.check : ''}</button>
+    <div class="body"><div class="ttl">${esc(r.text)}</div></div>
+    ${r.done ? '' : `<button class="btn sm ghost pin ${r.pinned ? 'on' : ''}" data-rempin="${esc(r.id)}" title="${r.pinned ? 'Unpin' : 'Keep at the top'}">${r.pinned ? 'Pinned' : 'Pin'}</button>`}
+    <button class="btn sm ghost" data-remdel="${esc(r.id)}" title="Delete">✕</button></div>`;
+}
+function bindReminders(root, after) {
+  const call = async (body, msg) => { try { await api('/api/reminders', body); if (msg) toast(msg); } catch (err) { toast(err.message); } after(); };
+  root.querySelectorAll('[data-remdone]').forEach(b => b.onclick = () => { b.disabled = true; const done = !b.classList.contains('on'); call({ id: b.dataset.remdone, done }, done ? 'Ticked off.' : ''); });
+  root.querySelectorAll('[data-rempin]').forEach(b => b.onclick = () => call({ id: b.dataset.rempin, pinned: !b.classList.contains('on') }));
+  root.querySelectorAll('[data-remdel]').forEach(b => b.onclick = () => call({ id: b.dataset.remdel, remove: true }, 'Deleted.'));
+  root.querySelectorAll('[data-remadd]').forEach(f => f.onsubmit = e => {
+    e.preventDefault();
+    const text = f.text.value.trim();
+    if (!text) return f.text.focus();
+    f.querySelector('button').disabled = true;
+    call({ text }, '');
+  });
+}
+async function renderReminders() {
+  topbar(`<h1>Reminders</h1><span class="muted hide-m">Things to remember that have no date. Anything with a time goes on the calendar.</span>`);
+  $('view').className = 'view pad';
+  const r = await api('/api/reminders');
+  $('remCount').textContent = r.open.length || '';
+  if (S.view !== 'reminders') return;
+  $('view').innerHTML = `<div class="wrap narrow">
+    <form class="rem-add big" data-remadd><input name="text" placeholder="Renew passport, call the bank, buy a charger…" autocomplete="off" maxlength="200" aria-label="New reminder"><button class="btn primary">Add</button></form>
+    <p class="hint" style="margin:8px 0 18px">Or tell ${esc(S.settings.agentName || 'Donna')}: “remind me to renew my passport”. They also run along the top of Today.</p>
+    <label class="check rem-ev"><input type="checkbox" id="remEv" ${r.reminderEvent ? 'checked' : ''}> <span>Also put them on my calendar as one event, <b>${esc(dayLabel(r.listDay, true))}, 09:00–10:00</b>, so they show on my phone. It updates as you tick them off, and moves to the next Monday each week.</span></label>
+    <div class="card"><h2>To remember<span class="hint">${r.open.length}</span></h2><div class="list">${r.open.map(remRow).join('') || '<div class="empty"><b>Nothing to remember</b>Add one above.</div>'}</div></div>
+    ${r.done.length ? `<div class="card"><h2>Done<span class="hint">kept for a while, in case you ticked one by mistake</span></h2><div class="list">${r.done.map(remRow).join('')}</div></div>` : ''}
+  </div>`;
+  $('remEv').onchange = async e => {
+    try { const x = await api('/api/reminders', { reminderEvent: e.target.checked }); problems(x.problems); toast(e.target.checked ? (r.open.length ? `On your calendar: ${dayLabel(x.listDay, true)}, 09:00.` : 'On. The event appears once you add a reminder.') : 'Removed from your calendar.'); }
+    catch (err) { toast(err.message); e.target.checked = !e.target.checked; }
+  };
+  bindReminders($('view'), () => { if (S.view === 'reminders') renderReminders().then(() => $('view').querySelector('[data-remadd] input')?.focus()); });
+}
+/** Today at a glance: one quiet line, set like a timetable footer. */
+function glance(items) {
+  const list = items.filter(Boolean);
+  return list.length ? `<div class="glance" aria-label="Today at a glance">${list.map(x => `<span>${x}</span>`).join('')}</div>` : '';
+}
+/** { weekday: "Monday", date: "9 November" } for a YYYY-MM-DD day. */
+/** ISO week number (Monday weeks) for a YYYY-MM-DD day. */
+function isoWeek(d) {
+  const x = new Date(d + 'T12:00:00Z');
+  x.setUTCDate(x.getUTCDate() + 4 - (x.getUTCDay() || 7));
+  return Math.ceil(((x - Date.UTC(x.getUTCFullYear(), 0, 1)) / 864e5 + 1) / 7);
+}
+function longDate(d) {
+  const x = new Date(d + 'T12:00:00');
+  return { weekday: x.toLocaleDateString('en-GB', { weekday: 'long' }), date: x.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' }) };
+}
+function paintToday(st, tm, rd, decisions = [], autoPlan = null, led = null, extra = {}) {
   S.data = st;
+  LEAN = extra.lean || null;
   const s = st.settings;
   const name = (s.userName || '').split(' ')[0];
-  const h = new Date().getHours();
-  const wake = hm(s.dayStart || '07:00'), sleep = hm(s.dayEnd || '23:00') || 1440;
+  const wake = hm(s.dayStart || '07:00'), sleep = hm(s.dayEnd || '23:00') > wake ? hm(s.dayEnd || '23:00') : 1440;
   const timed = st.events.filter(e => !e.allDay && e.kind !== 'buffer' && e.myStatus !== 'declined');
   const left = timed.filter(e => e.end > st.now);
   const free = freeMinutes(st.events, S.today, s, st.now);
@@ -320,9 +469,9 @@ function paintToday(st, tm, rd, decisions = [], autoPlan = null, led = null) {
     const e = energyAt(mins(row.start) + 15, wake, sleep);
     const tags = [row.meetLink && `<a class="pill acc" href="${esc(row.meetLink)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${ICON.video} Join</a>`,
       row.readOnly && `<span class="pill">${esc(row.calendarName || 'other calendar')}</span>`].filter(Boolean).join(' ');
-    const why = row.origin === 'auto' || row.origin === 'asked' ? (row.why ? `Why here: ${row.why}` : '') : '';
-    return `<div class="ag ${past ? 'past' : ''} ${cur ? 'now' : ''} ${row.origin === 'auto' ? 'is-auto' : ''} k-${row.readOnly ? 'busy' : row.category}" data-id="${esc(row.id)}">
-      <div class="t">${clock(row.start)} – ${clock(row.end)}<div class="en" title="Your energy at this time">${energyWord(e, mins(row.start), wake)}</div></div><div class="bar" style="background:var(--cc)"></div>
+    const why = row.origin === 'auto' && row.why ? `Why here: ${row.why}` : '';
+    return `<div class="ag ${past ? 'past' : ''} ${cur ? 'now' : ''} ${row.origin === 'auto' ? 'is-auto' : ''} k-${row.readOnly ? 'busy' : row.category}" data-id="${esc(row.id)}"${row.paint ? ` style="--cc:${row.paint}"` : ""}>
+      <div class="t">${clock(row.start)} – ${clock(row.end)}${e >= 0.95 && ['study', 'tasks', 'focus'].includes(row.category) ? '<div class="en" title="Placed in your peak focus hours">peak focus</div>' : ''}</div><div class="bar" style="background:var(--cc)"></div>
       <div style="min-width:0"><div class="title">${esc(row.title)} ${OWNER[row.origin || 'you'](row)}</div><div class="sub">${esc([dur(diff(row.start, row.end)), row.location, row.guests && row.guests.length ? row.guests.length + ' guest' + (row.guests.length > 1 ? 's' : '') : ''].filter(Boolean).join(' · '))}</div>
         ${why && !past ? `<div class="why">${esc(why)}</div>` : ''}</div>
       <div class="act-col">${tags}</div></div>`;
@@ -339,42 +488,64 @@ function paintToday(st, tm, rd, decisions = [], autoPlan = null, led = null) {
   const lead = nowEv ? `Right now: <b>${esc(nowEv.title)}</b> until ${clock(nowEv.end)}.` : next ? `Next for you: <b>${esc(next.title)}</b> in ${inMin(st.now, next.start)} (${clock(next.start)}).` : 'Nothing else on your plate today.';
   $('view').className = 'view pad';
   $('view').innerHTML = `<div class="wrap">
-    <div class="hero">
-      <div class="hero-top">
-        <div style="min-width:0"><h2>${h < 4 ? 'Still up' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'}${name ? ', ' + esc(name) : ''}</h2>
-          <p>${lead} ${left.length ? `${left.length} thing${left.length === 1 ? '' : 's'} left today.` : ''}</p>
-          ${name ? '' : '<p class="hint"><a href="#settings">Tell Donna your name</a> so this feels like yours.</p>'}</div>
-        <div class="chips">${["What's next?", 'Plan tomorrow for max productivity', 'Fix my conflicts this week'].map(x => `<button class="chip" data-ask="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+    <header class="masthead hero">
+      <div style="min-width:0">
+        <div class="kicker">${name ? esc(name) + "'s day" : 'Day'} ${dayOfYear(S.today)} · Week ${isoWeek(S.today)}</div>
+        <h2>${esc(longDate(S.today).weekday)}<br><em>${esc(longDate(S.today).date)}</em></h2>
+        ${name ? '' : '<p class="hint" style="margin:10px 0 0"><a href="#settings">Add your name</a></p>'}
       </div>
-      ${dayStrip(st, s)}
-    </div>
-    ${isIOS && !isStandalone() && !store.get('a2hsDismissed', false) ? `<div class="banner info" id="a2hs">📱<div style="flex:1">Put ${esc(s.agentName || 'Donna')} on your Home Screen: tap <b>Share</b> (□↑) → <b>Add to Home Screen</b>. It opens like an app, stays signed in and can notify you.</div><button class="btn sm ghost" id="a2hsX">✕</button></div>` : ''}
-    <div class="stats">
-      <div class="stat"><div class="k">Your free time left</div><div class="v">${dur(free.free)}</div><div class="hint">longest stretch ${dur(free.longest)}</div></div>
-      <div class="stat"><div class="k">Focus time today</div><div class="v">${dur(focusMin)}</div><div class="hint">study & task blocks</div></div>
-      <div class="stat"><div class="k">Your tasks on track</div><div class="v">${st.tasks.length ? `${tasksOk}/${st.tasks.length}` : '—'}</div><div class="hint">${st.tasks.length - tasksOk ? `<span class="bad-t">${st.tasks.length - tasksOk} at risk</span>` : st.tasks.length ? 'all fit before due' : 'none open'}</div></div>
-      <div class="stat"><div class="k">Your weekly goals</div><div class="v">${goals.length ? `${hrs(goalDone)}<small> / ${hrs(goalTarget)}</small>` : '—'}</div><div class="hint">${goals.length ? goals.map(g => esc(g.title)).join(', ') : '<a href="#tasks">set one</a>'}</div></div>
-    </div>
+      <div class="next-up">
+        <div class="kicker">${nowEv ? 'Happening now' : 'Right now'}</div>
+        <div class="when ${nowEv ? 'now' : ''}" id="liveClock" data-tz="${esc(s.timeZone || '')}"${nowEv ? ` data-start="${esc(nowEv.start)}" data-end="${esc(nowEv.end)}"` : next ? ` data-next="${esc(next.start)}"` : ''}>${nowEv ? '' : clock(st.now) + ':00'}</div>
+        <div class="what">${nowEv ? esc(nowEv.title) : next ? 'Next up: ' + esc(next.title) : 'Nothing else on your plate.'}</div>
+        <div class="sub">${[nowEv ? `<span id="liveLeft"></span> left · until ${clock(nowEv.end)}` : next ? `in <span id="liveIn">${inMin(st.now, next.start)}</span> · ${clock(next.start)}–${clock(next.end)}${next.location ? ' · ' + esc(next.location) : ''}` : '',
+          nowEv && next ? `then ${esc(next.title)} at ${clock(next.start)}` : '', left.length ? `${left.length} left today` : ''].filter(Boolean).join(' · ')}</div>
+      </div>
+    </header>
+    ${ticker(extra.reminders || [], s)}
+    ${glance([
+      `<b>${dur(free.free)}</b> free${free.longest ? `, longest ${dur(free.longest)}` : ''}`,
+      focusMin ? `<b>${dur(focusMin)}</b> focus` : '',
+      st.tasks.length ? `<b>${tasksOk}/${st.tasks.length}</b> tasks on track${st.tasks.length - tasksOk ? ` <span class="bad-t">(${st.tasks.length - tasksOk} at risk)</span>` : ''}` : '',
+      goals.length ? `<b>${hrs(goalDone)} / ${hrs(goalTarget)}</b> weekly goals` : '',
+      ...(extra.week || []).filter(d => d.due && d.due.length).slice(0, 2).map(d => `<b>${esc(d.due.map(x => x.title).slice(0, 2).join(', '))}</b> due ${d.date === S.today ? 'today' : DAYS[dow(d.date)]}`),
+      decisions.length ? `<b>${decisions.length}</b> change${decisions.length === 1 ? '' : 's'} by ${esc(s.agentName || 'Donna')}` : '',
+      tomorrow.length ? `tomorrow from <b>${clock(tomorrow[0].start)}</b>` : '',
+    ])}
+    ${dayStrip(st, s)}
+    ${isIOS && !isStandalone() && !store.get('a2hsDismissed', false) ? `<div class="banner info" id="a2hs"><div style="flex:1">Put ${esc(s.agentName || 'Donna')} on your Home Screen: tap <b>Share</b> (□↑) → <b>Add to Home Screen</b>. It opens like an app, stays signed in and can notify you.</div><button class="btn sm ghost" id="a2hsX">✕</button></div>` : ''}
+
     <div class="cards today-grid">
       <div class="card"><h2>${ICON.cal} Your day<span class="hint">${dayLabel(S.today, true)}</span></h2>
         ${allDay.length ? `<div class="row" style="margin-bottom:8px">${allDay.map(e => `<span class="pill acc">${esc(e.title)}</span>`).join('')}</div>` : ''}
         <div class="agenda" id="agenda">${agenda || '<div class="empty"><b>A clear day</b>It\'s yours. Ask Donna to plan something, or enjoy it.</div>'}</div></div>
       <div>
+        ${checkinCard(extra.checkin || [])}
+        ${remindersCard(extra.reminders || [])}
         ${trustCard(decisions, autoPlan, led)}
         ${issues.length ? `<div class="card"><h2>${ICON.warn} Needs you</h2>${issues.map(i => `<div class="issue"><span class="dot warn" style="margin-top:6px"></span><span>${esc(i)}</span></div>`).join('')}
           <div class="row" style="margin-top:10px"><button class="btn sm" data-ask="Fix my conflicts this week">Let Donna fix it</button></div></div>` : ''}
-        <div class="card"><h2>${ICON.check} Your tasks<span class="hint"><a href="#tasks">All</a></span></h2>
-          ${st.tasks.length ? st.tasks.slice(0, 5).map(t => taskRow(t, true)).join('') : '<div class="hint">No open tasks. Try: “OS assignment due Friday, about 3 hours”.</div>'}</div>
+        ${st.tasks.length ? `<div class="card"><h2>${ICON.check} Your tasks<span class="hint"><a href="#tasks">All</a></span></h2>
+          ${st.tasks.slice(0, 5).map(t => taskRow(t, true)).join('')}</div>` : ''}
         ${radarCards(rd)}
         <div class="card"><h2>${ICON.cal} Tomorrow<span class="hint">${dayLabel(addDays(S.today, 1))}</span></h2>
           ${tomorrow.length ? tomorrow.slice(0, 8).map(e => `<div class="issue" style="cursor:pointer" data-id="${esc(e.id)}"><span class="muted mono" style="font-size:12px;min-width:44px">${clock(e.start)}</span><span style="flex:1">${esc(e.title)}</span>${OWNER[e.origin || 'you'](e)}</div>`).join('') + (tomorrow.length > 8 ? `<div class="hint">+${tomorrow.length - 8} more</div>` : '') : '<div class="hint">Nothing yet.</div>'}</div>
       </div>
-    </div></div>`;
+    </div>
+    ${weekCard(extra.week || [])}</div>`;
+  tickLive();
   const all = [...st.events, ...tm.events];
   $('view').querySelectorAll('[data-id]').forEach(el => el.onclick = ev => { const e = all.find(x => x.id === el.dataset.id); if (e) openPop(e, el); });
   bindTaskRows($('view'));
+  bindReminders($('view'), () => { if (S.view === 'today') render(); });
+  $('view').querySelectorAll('[data-day]').forEach(b => b.onclick = () => { S.anchor = b.dataset.day; S.calView = 'day'; setView('calendar'); });
+  $('view').querySelectorAll('[data-ci]').forEach(b => b.onclick = async () => {
+    const row = b.closest('.ci'); row.querySelectorAll('button').forEach(x => x.disabled = true);
+    try { const r = await api('/api/session', { eventId: row.dataset.ev, status: b.dataset.ci }); toast(r.result || 'Saved.', { ms: 5000 }); } catch (err) { toast(err.message); }
+    render();
+  });
   const verdict = async (id, v) => {
-    try { const r = await api('/api/feedback', { id, verdict: v, reason: '' }); toast(r.text.split('\n')[0]); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/feedback', { id, verdict: v, reason: '' }); toast(r.text.split('\n')[0]); } catch (err) { toast(err.message); }
   };
   $('view').querySelectorAll('[data-undo]').forEach(b => b.onclick = async () => { b.disabled = true; await verdict(b.dataset.undo, 'undo'); loadChat().catch(() => {}); render(); });
   $('view').querySelectorAll('[data-keep]').forEach(b => b.onclick = async () => { b.disabled = true; await verdict(b.dataset.keep, 'good'); render(); });
@@ -386,24 +557,44 @@ function paintToday(st, tm, rd, decisions = [], autoPlan = null, led = null) {
   $('autopilot')?.addEventListener('click', async () => {
     const on = !S.settings.autonomous;
     if (!on && !confirm('Pause autopilot? Donna will only change things when you ask.')) return;
-    try { setStatus(await api('/api/settings', { autonomous: on })); toast(on ? 'Autopilot on. Every change it makes shows up here for you to keep or undo.' : 'Autopilot paused.'); } catch (err) { toast('⚠️ ' + err.message); }
+    try { setStatus(await api('/api/settings', { autonomous: on })); toast(on ? 'Autopilot on. Every change it makes shows up here for you to keep or undo.' : 'Autopilot paused.'); } catch (err) { toast(err.message); }
     render();
   });
   $('a2hsX')?.addEventListener('click', () => { store.set('a2hsDismissed', true); $('a2hs').remove(); });
 }
+// ─── Live clock (Today masthead): time into the current session, or the time of day ───
+const hms = sec => { const h = Math.floor(sec / 3600), p = n => String(n).padStart(2, '0'); return (h ? h + ':' : '') + p(Math.floor(sec % 3600 / 60)) + ':' + p(sec % 60); };
+// The wall clock in the calendar's time zone, as a Date comparable with event times ("YYYY-MM-DDTHH:MM").
+function wallNow(tz) {
+  try { const d = new Date(new Date().toLocaleString('sv-SE', tz ? { timeZone: tz } : {}).replace(' ', 'T')); if (!isNaN(d)) return d; } catch { /* unknown zone */ }
+  return new Date();
+}
+function tickLive() {
+  const el = $('liveClock');
+  if (!el) return;
+  const { tz, start, end, next } = el.dataset, w = wallNow(tz);
+  if (start) {
+    el.textContent = hms(Math.max(0, Math.floor((w - new Date(start)) / 1000)));
+    if ($('liveLeft')) $('liveLeft').textContent = hms(Math.max(0, Math.ceil((new Date(end) - w) / 1000)));
+  } else {
+    el.textContent = w.toTimeString().slice(0, 8);
+    if (next && $('liveIn')) $('liveIn').textContent = inMin(w, new Date(Math.max(w, new Date(next))));
+  }
+  // A session just started or ended: repaint once so the masthead and agenda move on.
+  const edge = end || next;
+  if (edge && w >= new Date(edge) && tickLive.edge !== edge && S.view === 'today') { tickLive.edge = edge; render(); }
+}
+setInterval(tickLive, 1000);
+
 // ─── Radar & goals (Today) ───
-const RADAR_ICON = { exam: '📝', presentation: '🎤', deadline: '⏰', travel: '✈️', task: '✅' };
 const hrs = m => (Math.round(m / 6) / 10).toString().replace(/\.0$/, '') + 'h';
 function radarCards(rd) {
   if (!rd) return '';
-  const items = (rd.items || []).slice(0, 8);
   const away = rd.away || [];
   const goals = (rd.goals || []).filter(g => g.active);
-  const coming = items.length || away.length ? `<div class="card"><h2>📌 Coming up<span class="hint">next 3 weeks</span></h2>
-    ${away.map(a => `<div class="banner warn" style="margin-bottom:8px">${ICON.warn}<div style="flex:1">${esc(a.text)}</div><button class="btn sm" data-ask="${esc(`I'm travelling: ${a.trip}. Cancel my in-person classes from ${a.from.replace('T', ' ')} until ${a.until.replace('T', ' ')}`)}">Handle classes</button></div>`).join('')}
-    ${items.map(x => `<div class="issue"><span style="min-width:22px">${RADAR_ICON[x.kind] || '•'}</span><span style="flex:1">${esc(x.title)}${x.atRisk ? ' <span class="pill bad">at risk</span>' : ''}</span><span class="hint" style="white-space:nowrap">${esc(x.when)}${x.time ? ' ' + esc(x.time) : ''}</span></div>`).join('')}
-    ${items.some(x => x.kind === 'exam') ? `<div class="row" style="margin-top:8px"><button class="btn sm" data-ask="Plan revision for my upcoming exams and evaluations, starting this week">Plan revision</button></div>` : ''}</div>` : '';
-  const goalCard = goals.length ? `<div class="card"><h2>🎯 This week<span class="hint"><a href="#tasks">Goals</a></span></h2>
+  // Only the travel clash warning stays on Today: it needs a decision. The list of upcoming items lives in the calendar.
+  const coming = away.map(a => `<div class="banner warn" style="margin-bottom:8px">${ICON.warn}<div style="flex:1">${esc(a.text)}</div><button class="btn sm" data-ask="${esc(`I'm travelling: ${a.trip}. Cancel my in-person classes from ${a.from.replace('T', ' ')} until ${a.until.replace('T', ' ')}`)}">Handle classes</button></div>`).join('');
+  const goalCard = goals.length ? `<div class="card"><h2>This week<span class="hint"><a href="#tasks">Goals</a></span></h2>
     ${goals.map(g => `<div style="margin:6px 0"><div class="row"><b style="font-weight:550">${esc(g.title)}</b><span class="spacer"></span><span class="hint">${hrs(g.done)} done · ${hrs(g.planned)} planned of ${hrs(g.target)}</span></div>
       <div class="progress"><i style="width:${Math.min(100, Math.round(g.done / g.target * 100))}%"></i></div></div>`).join('')}</div>` : '';
   return coming + goalCard;
@@ -428,14 +619,68 @@ $('plannerForm').onsubmit = e => {
   const list = f.items.value.split('\n').map(x => x.trim()).filter(Boolean);
   store.set('planItems', f.items.value);
   const d = f.day.value;
-  const when = d === S.today ? 'today' : d === addDays(S.today, 1) ? 'tomorrow' : dayLabel(d, true);
-  const parts = [`Plan my day for ${when}${f.from.value ? ` starting at ${f.from.value}` : ''}.`];
-  if (list.length) parts.push('Things to do:\n' + list.map(x => '- ' + x).join('\n'));
-  if (f.reflow.checked) parts.push('Also re-arrange my own study blocks already on that day if it helps (keep classes fixed).');
-  if (f.fill.checked) parts.push('Maximum productivity: fill the free gaps.');
-  if (!f.meals.checked) parts.push('No lunch or dinner breaks needed.');
-  $('planner').close();
-  ask(parts.join('\n'));
+  if (!list.length && !f.fill.checked && !f.reflow.checked) { toast('Add at least one thing to do (e.g. "CFA study 2h").'); return; }
+  const btn = f.querySelector('[type=submit]');
+  btn.disabled = true; btn.textContent = 'Planning…';
+  // Planned in code (no AI): instant, exact, and it works even when the AI is unavailable.
+  api('/api/planday', { date: d, from: f.from.value, lines: list, fill: f.fill.checked, meals: f.meals.checked, reflow: f.reflow.checked }, false, { timeout: 45000 })
+    .then(r => {
+      $('planner').close();
+      toast(`${d === S.today ? 'Today' : dayLabel(d, true)} is planned: ${r.actions.filter(a => !a.auto).length} blocks.`, { action: 'Undo', onAction: () => undoRun(r.actions.filter(a => !a.auto).map(a => a.id)), ms: 8000 });
+      loadChat().catch(() => {});
+      if (S.view === 'calendar') { S.anchor = d; S.calView = 'day'; }
+      render();
+    })
+    .catch(err => toast(err.message, { ms: 6000 }))
+    .finally(() => { btn.disabled = false; btn.textContent = 'Build my plan'; });
+};
+
+// ─── Plan my week: deadlines, weekly goals and habits in one form; the planner (code, not AI) books the week ───
+const WP_ROW = {
+  task: (ph = 'OS assignment') => `<div class="wp-row" data-kind="task"><input name="title" placeholder="${ph}" autocomplete="off"><input name="hours" type="number" min="0.5" max="40" step="0.5" placeholder="hours" title="Hours of work"><input name="due" type="date" value="${addDays(S.today, 4)}" title="Due"><button class="btn ghost icon sm" type="button" data-rm>✕</button></div>`,
+  goal: () => `<div class="wp-row" data-kind="goal"><input name="title" placeholder="CFA" autocomplete="off"><input name="hours" type="number" min="1" max="60" step="1" placeholder="h / week"><span></span><button class="btn ghost icon sm" type="button" data-rm>✕</button></div>`,
+  habit: () => `<div class="wp-row habit" data-kind="habit"><input name="title" placeholder="Gym" autocomplete="off"><input name="minutes" type="number" min="5" max="480" step="5" value="60" title="Minutes"><select name="days"><option value="daily">Every day</option><option value="weekdays">Weekdays</option><option value="weekends">Weekends</option><option value="MO,WE,FR">Mon, Wed, Fri</option><option value="TU,TH,SA">Tue, Thu, Sat</option></select><input name="from" type="time" value="17:00"><input name="to" type="time" value="21:00"><button class="btn ghost icon sm" type="button" data-rm>✕</button></div>`,
+};
+function openWeekPlanner() {
+  $('wpTasks').innerHTML = WP_ROW.task() + WP_ROW.task('Mid-sem prep');
+  $('wpGoals').innerHTML = WP_ROW.goal();
+  $('wpHabits').innerHTML = WP_ROW.habit();
+  $('wpResult').innerHTML = '';
+  $('weekForm').querySelector('[type=submit]').textContent = 'Plan my week';
+  $('weekPlanner').showModal();
+  setTimeout(() => $('wpTasks').querySelector('input').focus(), 30);
+}
+$('weekPlanner').addEventListener('click', e => {
+  if (e.target.closest('[data-close]') || e.target === $('weekPlanner')) { $('weekPlanner').close(); render(); return; }
+  const add = e.target.closest('[data-add]');
+  if (add) { const box = { task: 'wpTasks', goal: 'wpGoals', habit: 'wpHabits' }[add.dataset.add]; $(box).insertAdjacentHTML('beforeend', WP_ROW[add.dataset.add]()); $(box).lastElementChild.querySelector('input').focus(); }
+  const rm = e.target.closest('[data-rm]');
+  if (rm) rm.closest('.wp-row').remove();
+});
+$('weekForm').onsubmit = async e => {
+  e.preventDefault();
+  const btn = e.target.querySelector('[type=submit]');
+  if (btn.textContent === 'Done') { $('weekPlanner').close(); render(); return; }
+  const rows = [...$('weekForm').querySelectorAll('.wp-row')].map(r => ({ kind: r.dataset.kind, ...Object.fromEntries([...r.querySelectorAll('input, select')].map(i => [i.name, i.value.trim()])) })).filter(r => r.title);
+  if (!rows.length) { toast('Add at least one deadline, goal or habit.'); return; }
+  btn.disabled = true; btn.textContent = 'Planning…';
+  const done = [], failed = [];
+  for (const r of rows) {
+    try {
+      if (r.kind === 'task') { if (!(+r.hours > 0) || !r.due) throw new Error('needs hours and a due date'); await api('/api/tasks', { title: r.title, minutes: Math.round(+r.hours * 60), due: r.due }, false, { timeout: 45000 }); }
+      else if (r.kind === 'goal') { if (!(+r.hours > 0)) throw new Error('needs hours per week'); await api('/api/goals', { title: r.title, hours: +r.hours }, false, { timeout: 45000 }); }
+      else await api('/api/habits', { title: r.title, minutes: +r.minutes || 30, days: r.days, windowStart: r.from, windowEnd: r.to }, false, { timeout: 45000 });
+      done.push(r.title);
+    } catch (err) { failed.push(`${r.title}: ${err.message}`); }
+  }
+  const [{ week }, tasks] = await Promise.all([api('/api/home'), api('/api/tasks')]).catch(() => [{ week: [] }, []]);
+  const risky = tasks.filter(t => t.status === 'open' && t.atRisk), tight = tasks.filter(t => t.status === 'open' && t.crunch && !t.atRisk);
+  $('wpResult').innerHTML = `<div class="wp-done">${ICON.check}<div><b>Your week is planned.</b> ${done.length} item${done.length === 1 ? '' : 's'} added; ${dur((week || []).reduce((n, d) => n + d.focus, 0))} of focus booked.
+    ${risky.length ? `<div class="bad-t">Won't fully fit before the deadline: ${risky.map(t => esc(t.title)).join(', ')}. Move something or extend the deadline.</div>` : ''}
+    ${tight.length ? `<div class="hint">Tight (more sessions a day than usual): ${tight.map(t => esc(t.title)).join(', ')}.</div>` : ''}
+    ${failed.length ? `<div class="bad-t">Not added: ${failed.map(esc).join('; ')}</div>` : ''}</div></div>${weekCard(week || [])}`;
+  btn.disabled = false; btn.textContent = 'Done';
+  $('taskCount').textContent = tasks.filter(t => t.status === 'open').length || '';
 };
 
 function freeMinutes(events, d, s, now) {
@@ -459,7 +704,7 @@ async function runNow() {
     const r = await api('/api/run', {});
     const n = r && r.actions ? r.actions.length : 0;
     toast(n ? `${n} change${n === 1 ? '' : 's'}${r.text ? ': ' + r.text.slice(0, 120) : ''}` : 'All good. Nothing needed changing.', { ms: 5000 });
-  } catch (err) { toast('⚠️ ' + err.message); }
+  } catch (err) { toast(err.message); }
   loadChat(); render();
 }
 
@@ -557,7 +802,7 @@ function drawGrid() {
       const width = n > 1 ? `left:calc(${(c / n) * 100}% + 2px);width:calc(${100 / n}% - 4px);right:auto;` : '';
       const movable = !o.readOnly && o.kind !== 'buffer';
       const icons = [o.recurringId || o.groupId ? '↻' : '', o.meetLink ? '▶' : '', o.highStakes || o.view.highStakes ? '★' : '', o.organizer === false && !o.readOnly ? '✉' : ''].filter(Boolean).join(' ');
-      return `<div class="${cls}" style="top:${top}px;height:${h}px;${width}" data-id="${esc(o.id)}" ${movable ? 'data-move="1"' : ''} title="${esc(o.title)} · ${clock(o.start)}–${clock(o.end)}">
+      return `<div class="${cls}" style="top:${top}px;height:${h}px;${width}${o.paint ? `--cc:${o.paint};` : ""}" data-id="${esc(o.id)}" ${movable ? 'data-move="1"' : ''} title="${esc(o.title)} · ${clock(o.start)}–${clock(o.end)}">
         ${o.kind === 'buffer' ? '' : `<b>${esc(o.title)}</b>${h > 30 ? `<span class="tm">${clock(o.start)}–${clock(o.end)} ${icons}</span>` : ''}`}${movable && h > 20 ? '<span class="rs"></span>' : ''}</div>`;
     }).join('');
     const now = d === st.today ? `<div class="nowline" style="top:${mins(st.now) * px}px"></div>` : '';
@@ -658,13 +903,13 @@ function bindGrid() {
       toast(`Moved "${d.ev.title}" to ${dayLabel(d.newStart.slice(0, 10))} ${clock(d.newStart)}`, { action: 'Undo', onAction: async () => {
         await api('/api/events/update', { id: r.event ? r.event.id : d.ev.id, origStart: d.newStart, ...before }); renderCalendar();
       } });
-    } catch (err) { toast('⚠️ ' + err.message); }
+    } catch (err) { toast(err.message); }
     renderCalendar();
   };
   body.addEventListener('pointerup', end);
   body.addEventListener('pointercancel', () => { if (drag && drag.started) drawGrid(); drag = null; });
 }
-function problems(list) { if (list && list.length) toast('⚠️ Google: ' + list.join('; ')); }
+function problems(list) { if (list && list.length) toast('Google: ' + list.join('; ')); }
 
 // ─── Event popover ───
 let popEl = null;
@@ -676,12 +921,14 @@ function openPop(ev, anchor) {
   closePop();
   const p = document.createElement('div');
   p.className = `pop k-${ev.readOnly ? 'busy' : ev.category}`;
+  p.style.cssText = ev.paint ? `--cc:${ev.paint}` : '';
   const len = diff(ev.start, ev.end);
   const when = ev.allDay ? `${dayLabel(ev.start.slice(0, 10), true)} · all day` : `${dayLabel(ev.start.slice(0, 10), true)} · ${clock(ev.start)} – ${clock(ev.end)} (${dur(len)})`;
   const tags = [ev.agent && ['focus', 'habit', 'task'].includes(ev.kind) ? `<span class="pill acc">${ev.taskId ? 'Task session' : ev.habitId ? 'Habit' : 'Focus'} · placed by ${esc(S.settings.agentName || 'Donna')}</span>` : ev.agent ? `<span class="pill acc">Made by ${esc(S.settings.agentName || 'Donna')}</span>` : '',
     ev.view.highStakes ? '<span class="pill warn">High-stakes</span>' : '', ev.view.protected ? '<span class="pill">Protected</span>' : '', ev.view.flexible ? '<span class="pill">Flexible</span>' : '',
     ev.organizer === false && !ev.readOnly ? '<span class="pill">Invitation</span>' : '', ev.recurringId || ev.groupId ? `<span class="pill">${ICON.repeat} Repeats</span>` : '',
-    ev.myStatus === 'declined' ? '<span class="pill bad">Declined</span>' : ''].filter(Boolean).join('');
+    ev.myStatus === 'declined' ? '<span class="pill bad">Declined</span>' : '',
+    ev.priority ? `<span class="pill"><i class="dotc" style="background:${esc(ev.paint)}"></i>Priority: ${esc(ev.priority)}</span>` : ''].filter(Boolean).join('');
   p.innerHTML = `<h3><span class="sw"></span><span>${esc(ev.title)}</span></h3><div class="when">${when}</div>
     ${tags ? `<div class="tags">${tags}</div>` : ''}
     <div class="meta">
@@ -709,7 +956,7 @@ function openPop(ev, anchor) {
     let scope = 'this';
     if (ev.recurringId || ev.groupId) scope = confirm(`"${ev.title}" repeats.\n\nOK = delete the whole series\nCancel = delete only this one`) ? 'series' : 'this';
     else if (!confirm(`Delete "${ev.title}"?`)) return;
-    try { const r = await api('/api/events/delete', { id: ev.id, origStart: ev.start, scope }); problems(r.problems); toast('Deleted'); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/events/delete', { id: ev.id, origStart: ev.start, scope }); problems(r.problems); toast('Deleted'); } catch (err) { toast(err.message); }
     render();
   });
   p.querySelector('[data-a="ask"]').addEventListener('click', () => {
@@ -741,7 +988,7 @@ function openEditor(ev) {
 $('editor').addEventListener('click', e => { if (e.target.closest('[data-close]') || e.target === $('editor')) $('editor').close(); });
 $('deleteBtn').onclick = async () => {
   const scope = $('editorForm').querySelector('input[name=scope]:checked').value;
-  try { const r = await api('/api/events/delete', { id: editing.id, origStart: editing.start, scope }); problems(r.problems); } catch (err) { return toast('⚠️ ' + err.message); }
+  try { const r = await api('/api/events/delete', { id: editing.id, origStart: editing.start, scope }); problems(r.problems); } catch (err) { return toast(err.message); }
   $('editor').close(); toast('Deleted'); render();
 };
 $('editorForm').onsubmit = async e => {
@@ -757,7 +1004,7 @@ $('editorForm').onsubmit = async e => {
     const r = editing.id ? await api('/api/events/update', { id: editing.id, origStart: editing.start, scope: f.querySelector('input[name=scope]:checked').value, ...data }) : await api('/api/events', data);
     problems(r.problems);
     $('editor').close(); toast(editing.id ? 'Saved' : 'Added'); render();
-  } catch (err) { toast('⚠️ ' + err.message); }
+  } catch (err) { toast(err.message); }
 };
 
 // ─── Tasks ───
@@ -767,15 +1014,15 @@ function taskRow(t, compact) {
   const overdue = due < (S.data ? S.data.now : '');
   return `<div class="li ${t.status === 'done' ? 'done' : ''}" data-task="${esc(t.id)}">
     <button class="circle ${t.status === 'done' ? 'on' : ''}" data-done="${esc(t.id)}" title="${t.status === 'done' ? 'Reopen' : 'Mark done'}">${t.status === 'done' ? ICON.check : ''}</button>
-    <div class="body"><div class="ttl">${esc(t.title)} ${t.priority === 'high' ? '<span class="pill warn">High</span>' : ''} ${t.atRisk ? '<span class="pill bad">At risk</span>' : ''}</div>
-      <div class="sub">Due ${esc(relDay(due.slice(0, 10), S.today))}${t.due.length > 10 ? ' ' + clock(t.due) : ''}${overdue ? ' · overdue' : ''} · ${dur(t.spent || 0)} of ${dur(t.minutes)} done${!compact && t.sessions && t.sessions.length ? ` · next: ${esc(t.sessions[0])}` : ''}</div>
+    <div class="body"><div class="ttl">${esc(t.title)}${t.goalId && t.week && t.week > S.today ? ' <span class="pill">next week</span>' : ''} ${t.priority === 'high' ? '<span class="pill warn">High</span>' : ''} ${t.atRisk ? '<span class="pill bad" title="Not all of it fits before the deadline">At risk</span>' : t.crunch ? '<span class="pill warn" title="It only fits with more sessions a day than usual">Tight</span>' : ''}</div>
+      <div class="sub">Due ${esc(relDay(due.slice(0, 10), S.today))}${t.due.length > 10 ? ' ' + clock(t.due) : ''}${overdue ? ' · overdue' : ''} · ${dur(t.spent || 0)} of ${dur(t.minutes)} done${t.booked ? ` · ${dur(t.booked)} booked` : ""}${!compact && t.sessions && t.sessions.length ? ` · next: ${esc(t.sessions[0])}` : ''}</div>
       <div class="progress"><i style="width:${pct}%"></i></div></div>
     ${compact ? '' : `<button class="btn sm ghost" data-deltask="${esc(t.id)}" title="Delete">✕</button>`}</div>`;
 }
 function bindTaskRows(root) {
   root.querySelectorAll('[data-done]').forEach(b => b.onclick = async () => {
     const done = !b.classList.contains('on');
-    try { await api('/api/tasks', { id: b.dataset.done, status: done ? 'done' : 'open' }); toast(done ? 'Nice — task done. Freed its future sessions.' : 'Reopened'); } catch (err) { toast('⚠️ ' + err.message); }
+    try { await api('/api/tasks', { id: b.dataset.done, status: done ? 'done' : 'open' }); toast(done ? 'Nice — task done. Freed its future sessions.' : 'Reopened'); } catch (err) { toast(err.message); }
     render();
   });
   root.querySelectorAll('[data-deltask]').forEach(b => b.onclick = async () => {
@@ -784,7 +1031,8 @@ function bindTaskRows(root) {
   });
 }
 async function renderTasks() {
-  topbar(`<h1>Tasks</h1><span class="muted hide-m">Donna books work sessions before each due date and re-plans when your day changes.</span><span class="spacer"></span>`);
+  topbar(`<h1>Tasks</h1><span class="muted hide-m hide-n">Donna books work sessions before each due date and re-plans when your day changes.</span><span class="spacer"></span><button class="btn primary" id="planWeekT">${ICON.cal}<span class="hide-m">Plan my week</span></button>`);
+  $('planWeekT').onclick = () => openWeekPlanner();
   const [tasks, rd] = await Promise.all([api('/api/tasks'), api('/api/radar').catch(() => ({ goals: [] }))]);
   const goals = rd.goals || [];
   if (!S.data) S.data = { now: new Date().toISOString().slice(0, 16) };
@@ -804,7 +1052,7 @@ async function renderTasks() {
       <div class="row" style="margin-top:12px"><span class="hint">Or just tell ${esc(S.settings.agentName || 'Donna')}: “DBMS project due ${dayLabel(tomorrow)}, about 5 hours”.</span><span class="spacer"></span><button class="btn primary">Add &amp; plan</button></div>
     </form>
     <div class="card"><h2>Open<span class="hint">${open.length}</span></h2><div class="list">${open.map(t => taskRow(t)).join('') || '<div class="empty"><b>Nothing open</b>Add a task above and it gets time on your calendar automatically.</div>'}</div></div>
-    <div class="card"><h2>🎯 Weekly goals<span class="hint">your own blocks count; only the shortfall gets booked</span></h2>
+    <div class="card"><h2>Weekly goals<span class="hint">your own blocks count; only the shortfall gets booked</span></h2>
       <div class="list">${goals.map(g => `<div class="li"><div class="body"><div class="ttl">${esc(g.title)} · ${hrs(g.target)}/week ${g.atRisk ? '<span class="pill bad">behind</span>' : ''}</div>
         <div class="sub">${hrs(g.done)} done · ${hrs(g.planned)} planned this week${g.match && g.match !== g.title.toLowerCase() ? ` · counts “${esc(g.match)}”` : ''}</div><div class="progress"><i style="width:${Math.min(100, Math.round(g.planned / g.target * 100))}%"></i></div></div>
         <button class="btn sm ghost" data-delgoal="${esc(g.id)}" title="Remove">✕</button></div>`).join('') || '<div class="hint">No goals yet. Say “10 hours of CFA a week”, or add one here.</div>'}</div>
@@ -814,7 +1062,7 @@ async function renderTasks() {
   bindTaskRows($('view'));
   $('goalForm').onsubmit = async e => {
     e.preventDefault();
-    try { const r = await api('/api/goals', { title: e.target.title.value.trim(), hours: +e.target.hours.value }); problems(r.problems); toast(`Goal set. ${hrs(r.goal.planned)} of ${hrs(r.goal.target)} planned this week.`); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/goals', { title: e.target.title.value.trim(), hours: +e.target.hours.value }); problems(r.problems); toast(`Goal set. ${hrs(r.goal.planned)} of ${hrs(r.goal.target)} planned this week.`); } catch (err) { toast(err.message); }
     renderTasks();
   };
   $('view').querySelectorAll('[data-delgoal]').forEach(b => b.onclick = async () => { if (!confirm('Remove this goal? Its future sessions are freed.')) return; await api('/api/goals', { id: b.dataset.delgoal, remove: true }); renderTasks(); });
@@ -826,17 +1074,17 @@ async function renderTasks() {
       const r = await api('/api/tasks', { title: f.title.value.trim(), minutes: Math.round(+f.hours.value * 60), due: f.due.value, priority: f.priority.value });
       problems(r.problems);
       toast(r.task.atRisk ? `Added, but only part fits before it's due — free up some time.` : `Added. Booked ${r.task.sessions.length} session${r.task.sessions.length === 1 ? '' : 's'}.`, { ms: 5000 });
-    } catch (err) { toast('⚠️ ' + err.message); }
+    } catch (err) { toast(err.message); }
     renderTasks();
   };
 }
 
 // ─── Habits ───
 const HABIT_PRESETS = [
-  { title: '🏋️ Gym', minutes: 60, days: 'MO,TU,WE,TH,FR', windowStart: '17:00', windowEnd: '21:00', idealTime: '18:00', kind: 'personal' },
-  { title: '🍽️ Lunch', minutes: 45, days: 'daily', windowStart: '12:30', windowEnd: '14:30', idealTime: '13:00', kind: 'personal' },
-  { title: '🎯 Deep work', minutes: 90, days: 'MO,TU,WE,TH,FR', windowStart: '09:00', windowEnd: '13:00', idealTime: '09:30', kind: 'focus' },
-  { title: '📖 Reading', minutes: 30, days: 'daily', windowStart: '21:00', windowEnd: '23:00', idealTime: '22:00', kind: 'personal' },
+  { title: 'Gym', minutes: 60, days: 'MO,TU,WE,TH,FR', windowStart: '17:00', windowEnd: '21:00', idealTime: '18:00', kind: 'personal' },
+  { title: 'Lunch', minutes: 45, days: 'daily', windowStart: '12:30', windowEnd: '14:30', idealTime: '13:00', kind: 'personal' },
+  { title: 'Deep work', minutes: 90, days: 'MO,TU,WE,TH,FR', windowStart: '09:00', windowEnd: '13:00', idealTime: '09:30', kind: 'focus' },
+  { title: 'Reading', minutes: 30, days: 'daily', windowStart: '21:00', windowEnd: '23:00', idealTime: '22:00', kind: 'personal' },
 ];
 async function renderHabits() {
   topbar(`<h1>Habits</h1><span class="muted hide-m">Flexible routines placed in the best free slot of their window each day.</span>`);
@@ -878,7 +1126,7 @@ async function renderHabits() {
       const r = await api('/api/habits', { title: f.title.value.trim(), minutes: +f.minutes.value, windowStart: f.windowStart.value, windowEnd: f.windowEnd.value, idealTime: f.idealTime.value, kind: f.kind.value, days: days.length === 7 ? 'daily' : days.join(',') });
       problems(r.problems);
       toast(`Added. Placed ${r.placed ? r.placed.length : 0} block(s) in the next days.`);
-    } catch (err) { toast('⚠️ ' + err.message); }
+    } catch (err) { toast(err.message); }
     renderHabits();
   };
   $('view').querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => { if (!confirm('Remove this habit and its upcoming blocks?')) return; await api('/api/habits', { id: b.dataset.rm, remove: true }); renderHabits(); });
@@ -914,7 +1162,7 @@ async function renderInsights() {
 
 // ─── Activity ───
 async function renderActivity() {
-  topbar(`<h1>Activity</h1><span class="muted hide-m">Every change has an id. 👍 teaches, 👎 undoes and learns a rule.</span><span class="spacer"></span><button class="btn" id="runNow">${ICON.spark}<span class="hide-m">Check my plan</span></button>`);
+  topbar(`<h1>Activity</h1><span class="muted hide-m">Every change has an id. Good teaches; Bad undoes it and learns a rule.</span><span class="spacer"></span><button class="btn" id="runNow">${ICON.spark}<span class="hide-m">Check my plan</span></button>`);
   $('runNow').onclick = runNow;
   const rows = await api('/api/activity');
   const f = S.activityFilter;
@@ -926,7 +1174,7 @@ async function renderActivity() {
       const canRate = !undone && a.type !== 'revert' && !a.feedback;
       return `<div class="li ${undone ? 'done' : ''}"><div class="body"><div class="ttl"><span class="mono" style="color:var(--accent);font-size:12px">${esc(a.id)}</span> ${esc(a.summary)}</div>
         <div class="sub">${esc(a.rationale)} · ${esc(relDay(a.time.slice(0, 10), S.today))} ${clock(a.time)} · ${a.auto ? 'automatic' : a.source === 'booking' ? 'booking page' : 'your request'}</div></div>
-        ${canRate ? `<span class="fb"><button data-id="${esc(a.id)}" data-v="Good" title="Good">👍</button><button data-id="${esc(a.id)}" data-v="Bad" title="Bad: undo and learn">👎</button></span>` : `<span class="pill">${esc(undone ? 'undone' : (a.feedback || '').split(':')[0])}</span>`}</div>`;
+        ${canRate ? `<span class="fb"><button data-id="${esc(a.id)}" data-v="Good" title="Good">Good</button><button data-id="${esc(a.id)}" data-v="Bad" title="Bad: undo and learn">Bad</button></span>` : `<span class="pill">${esc(undone ? 'undone' : (a.feedback || '').split(':')[0])}</span>`}</div>`;
     }).join('') || '<div class="empty"><b>No activity yet</b>Changes Donna makes show up here.</div>'}</div></div></div>`;
   $('view').querySelectorAll('[data-f]').forEach(b => b.onclick = () => { S.activityFilter = b.dataset.f; renderActivity(); });
   $('view').querySelectorAll('.fb button').forEach(b => b.onclick = () => feedback(b.dataset.id, b.dataset.v));
@@ -942,14 +1190,15 @@ async function renderMemory() {
     ['Based on', p.basedOnEvents != null && p.basedOnEvents + ' past events']].filter(x => x[1]);
   $('view').className = 'view pad';
   $('view').innerHTML = `<div class="wrap">
-    <div class="card"><h2>Rules<span class="hint">from your words, 👎 feedback, or added here</span></h2><div class="list" id="rules">
+    <div class="card"><h2>Rules<span class="hint">from your words, Bad feedback, or added here</span></h2><div class="list" id="rules">
       ${m.rules.map(r => `<div class="li"><input type="checkbox" class="check" data-rule="${esc(r.id)}" ${r.active ? 'checked' : ''} title="Active" style="margin-top:3px;width:16px;height:16px;accent-color:var(--accent)"><div class="body"><div class="ttl" style="font-weight:450">${esc(r.text)}</div><div class="sub">from ${esc(r.source)} · ${esc(r.time.slice(0, 10))}</div></div><button class="btn sm ghost" data-delrule="${esc(r.id)}">✕</button></div>`).join('') || '<div class="hint">No rules yet. Say things like “never book anything before 10 on weekends”.</div>'}
     </div><form class="row" id="ruleForm" style="margin-top:10px"><input id="ruleInput" placeholder="e.g. Keep Sunday evenings free" style="flex:1;min-width:200px"><button class="btn primary">Add rule</button></form></div>
     <div class="card"><h2>People<span class="hint">names → emails for invites</span></h2><div class="list">
       ${m.people.map(x => `<div class="li"><div class="body"><div class="ttl">${esc(x.name)}</div><div class="sub">${esc(x.email || 'no email')}${x.note ? ' · ' + esc(x.note) : ''}</div></div><button class="btn sm ghost" data-delperson="${esc(x.id)}">✕</button></div>`).join('') || '<div class="hint">Nobody yet. Say “Riya’s email is riya@college.edu”.</div>'}
     </div><form class="row" id="personForm" style="margin-top:10px"><input name="name" placeholder="Name" style="flex:1;min-width:120px" required><input name="email" type="email" placeholder="email@example.com" style="flex:1.4;min-width:160px"><button class="btn">Add</button></form></div>
+    ${hoursCard(m.rhythm || {}, S.settings)}
     <div class="cards">
-      <div class="card"><h2>Lessons from 👎</h2>${m.lessons.slice().reverse().slice(0, 12).map(l => `<div class="issue"><span>${esc(l.did)}<div class="hint">You said “${esc(l.reason)}”${l.rule ? ` → ${esc(l.rule)}` : ''}</div></span></div>`).join('') || '<div class="hint">None yet.</div>'}</div>
+      <div class="card"><h2>Lessons from your feedback</h2>${m.lessons.slice().reverse().slice(0, 12).map(l => `<div class="issue"><span>${esc(l.did)}<div class="hint">You said “${esc(l.reason)}”${l.rule ? ` → ${esc(l.rule)}` : ''}</div></span></div>`).join('') || '<div class="hint">None yet.</div>'}</div>
       <div class="card"><h2>Habits from your calendar<span class="hint"><button class="btn sm" id="relearn">Re-analyse</button></span></h2>${prof.map(([k, v]) => `<div class="issue"><b style="min-width:150px;font-weight:550">${k}</b><span>${esc(v)}</span></div>`).join('') || '<div class="hint">Not enough history yet.</div>'}
         ${(m.adjustments || []).length ? `<div class="hint" style="margin-top:10px"><b>Observed from your edits</b><br>${m.adjustments.slice(-6).reverse().map(esc).join('<br>')}</div>` : ''}</div>
     </div></div>`;
@@ -958,11 +1207,81 @@ async function renderMemory() {
   v.querySelectorAll('[data-delrule]').forEach(x => x.onclick = async () => { if (confirm('Delete this rule?')) { await api('/api/rules', { id: x.dataset.delrule, remove: true }); renderMemory(); } });
   v.querySelectorAll('[data-delperson]').forEach(x => x.onclick = async () => { await api('/api/people', { id: x.dataset.delperson, remove: true }); renderMemory(); });
   $('ruleForm').onsubmit = async e => { e.preventDefault(); const t = $('ruleInput').value.trim(); if (!t) return; await api('/api/rules', { text: t }); renderMemory(); };
-  $('personForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/people', { name: e.target.name.value, email: e.target.email.value }); renderMemory(); } catch (err) { toast('⚠️ ' + err.message); } };
+  $('personForm').onsubmit = async e => { e.preventDefault(); try { await api('/api/people', { name: e.target.name.value, email: e.target.email.value }); renderMemory(); } catch (err) { toast(err.message); } };
   $('relearn').onclick = async () => { await api('/api/relearn', {}); toast('Re-analysed your calendar'); renderMemory(); };
+  bindHours(v);
+}
+
+// ─── Your hours: what the planner has learned about each hour of your day (src/rhythm.js) ───
+const HZ_MAX = 1.2; // the most one hour's history can add or take (MAX_BIAS in src/rhythm.js)
+const hh = h => `${p2(h % 24)}:00`;
+const hrsOf = x => `${x >= 10 ? Math.round(x) : +x.toFixed(1)} h`;
+const leanWord = l => l >= 0.15 ? 'better than your usual' : l <= -0.15 ? 'worse than your usual' : 'about your usual';
+
+function hoursCard(r, s) {
+  const agent = esc(s.agentName || 'Donna');
+  const kinds = (r.kinds || []).filter(k => k.ready);
+  const n = r.signals || 0;
+  const head = `<h2>Your hours<span class="hint">${n ? `from ${n} check-in${n === 1 ? '' : 's'} and edit${n === 1 ? '' : 's'} · <a href="#" id="hzReset">start over</a>` : 'learned from what you do'}</span></h2>`;
+  if (!kinds.length) {
+    const have = (r.kinds || []).reduce((a, k) => Math.max(a, k.evidence), 0);
+    return `<div class="card">${head}<div class="hint" style="max-width:70ch">${agent} starts with a standard guess: sharpest a while after you wake, slower after lunch. It replaces that guess with your own record as you go. Tick <b>Done</b> or <b>Missed</b> on a finished work session on Today, or drag a block ${agent} placed to a time you prefer. After about ${r.needed || 3} hours of sessions it begins to favour the hours you finish work in and avoid the ones you skip.${have ? ` So far: ${hrsOf(have)}.` : ''}</div></div>`;
+  }
+  const wake = Math.floor(hm(s.dayStart || '07:00') / 60), down = hm(s.dayEnd || '23:00');
+  const span = down > wake * 60 ? Math.ceil(down / 60) - wake : 24 - wake + Math.ceil(down / 60);
+  const hours = Array.from({ length: Math.max(1, Math.min(24, span)) }, (_, i) => (wake + i) % 24);
+  return `<div class="card">${head}
+    <p class="hint" style="max-width:74ch;margin:0 0 14px">Each bar is one hour of your day: up means work booked then gets done more often than your usual, down means it gets missed more. ${agent} leans its own bookings the same way. It never books while you are asleep or over a commitment, whatever the bars say.</p>
+    <div class="hz-legend"><span><i class="up"></i>Better than your usual</span><span><i class="down"></i>Worse than your usual</span><span><i class="flat"></i>About usual</span></div>
+    ${kinds.map(k => hoursChart(k, hours)).join('')}
+  </div>`;
+}
+
+function hoursChart(k, hours) {
+  const row = h => k.hours[h] || { h, worked: 0, didnt: 0, lean: 0 };
+  // An hour with no sessions of its own still leans the way its neighbours do (the planner uses that too), so it is drawn.
+  const seen = hours.map(row).filter(x => x.worked + x.didnt > 0 || x.lean);
+  const best = seen.reduce((a, x) => x.lean > (a ? a.lean : 0.15) ? x : a, null), worst = seen.reduce((a, x) => x.lean < (a ? a.lean : -0.15) ? x : a, null);
+  const cols = hours.map(h => {
+    const x = row(h), own = x.worked + x.didnt > 0, has = own || !!x.lean, pct = Math.min(50, Math.abs(x.lean) / HZ_MAX * 50), dir = !has ? '' : x.lean >= 0.05 ? 'up' : x.lean <= -0.05 ? 'down' : 'flat';
+    // Only the best and the worst hour carry a label; every other value is in the tooltip and the table.
+    const label = x === best || x === worst ? `<em style="${x.lean > 0 ? `bottom:calc(50% + ${pct.toFixed(1)}% + 3px)` : `top:calc(50% + ${pct.toFixed(1)}% + 3px)`}">${hh(h)}</em>` : '';
+    const tip = `${hh(h)}–${hh(h + 1)}|${has ? leanWord(x.lean) : 'no record yet'}|${own ? `finished ${hrsOf(x.worked)}, missed ${hrsOf(x.didnt)}` : has ? 'no sessions here yet: going by the hours next to it' : ''}`;
+    return `<button type="button" class="hz-col" data-tip="${esc(tip)}" aria-label="${esc(tip.split('|').filter(Boolean).join(', '))}">${dir ? `<i class="${dir}"${dir === 'flat' ? '' : ` style="height:${Math.max(2, pct).toFixed(1)}%"`}></i>` : ''}${label}</button>`;
+  }).join('');
+  const axis = hours.map((h, i) => `<span>${h % 3 === 0 || i === 0 ? hh(h) : ''}</span>`).join('');
+  return `<figure class="hz" aria-label="${esc(k.label)} by hour of day">
+    <figcaption><b>${esc(k.label)}</b><span class="hint">you usually finish ${k.usual}% · ${hrsOf(k.evidence)} on record</span></figcaption>
+    <div class="hz-plot">${cols}</div><div class="hz-axis">${axis}</div>
+    <details class="hz-table"><summary>Show as a table</summary><table><thead><tr><th>Hour</th><th>Finished</th><th>Missed</th><th>Compared with your usual</th></tr></thead>
+      <tbody>${seen.map(x => `<tr><td>${hh(x.h)}–${hh(x.h + 1)}</td><td>${hrsOf(x.worked)}</td><td>${hrsOf(x.didnt)}</td><td>${leanWord(x.lean)}${x.worked + x.didnt > 0 ? '' : ' (from the hours next to it)'}</td></tr>`).join('') || '<tr><td colspan="4">No record inside your waking hours yet.</td></tr>'}</tbody></table></details>
+  </figure>`;
+}
+
+/** Hover or keyboard focus on an hour shows its numbers; the same numbers are in the table below the chart. */
+function bindHours(root) {
+  const reset = root.querySelector('#hzReset');
+  if (reset) reset.onclick = async e => { e.preventDefault(); if (!confirm('Forget what has been learned about your hours and go back to the standard guess?')) return; await api('/api/rhythm/reset', {}); renderMemory(); };
+  let tip = null;
+  const hide = () => { if (tip) { tip.remove(); tip = null; } };
+  const show = el => {
+    const [when, verdict, detail] = el.dataset.tip.split('|');
+    hide();
+    tip = document.createElement('div'); tip.className = 'viz-tip';
+    const b = document.createElement('b'); b.textContent = verdict;
+    const t = document.createElement('span'); t.textContent = when + (detail ? ' · ' + detail : '');
+    tip.append(b, t);
+    document.body.append(tip);
+    const r = el.getBoundingClientRect(), w = tip.offsetWidth;
+    tip.style.left = Math.max(8, Math.min(window.innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + 'px';
+    tip.style.top = Math.max(8, r.top - tip.offsetHeight - 6) + 'px';
+  };
+  root.querySelectorAll('.hz-col').forEach(el => { el.onpointerenter = el.onfocus = () => show(el); el.onpointerleave = el.onblur = hide; });
 }
 
 // ─── Settings ───
+/** The one signal colour: "now", "needs you" and the next action. Everything else is ink on paper. */
+const ACCENTS = [['', 'Vermilion', '#d4441c'], ['cobalt', 'Cobalt', '#2343b8'], ['forest', 'Forest', '#24683f'], ['mono', 'Ink only', 'currentColor']];
 const PROVIDER_INFO = {
   'workers-ai': { name: 'Cloudflare Workers AI', note: 'Built in on the hosted app. Free daily allowance, no key.', key: null },
   gemini: { name: 'Google Gemini', note: 'Free key, ~1,000 requests/day on Flash-Lite.', key: 'geminiApiKey', model: 'geminiModel', url: 'https://aistudio.google.com/apikey' },
@@ -981,28 +1300,31 @@ async function renderSettings() {
   const v3 = s.google && s.bridgeVersion >= 3;
   $('view').className = 'view pad';
   $('view').innerHTML = `<form class="wrap settings" id="settingsForm" autocomplete="off">
-    ${s.authEnabled ? `<section class="card" id="security"><h2>🔐 Security</h2><p class="hint">Sign in with your fingerprint or face (Windows Hello, Touch ID, Face ID) instead of the password. The key never leaves your device.</p><div id="securityBody" class="hint">Loading…</div></section>` : ''}
-    <section class="card" id="iphone"><h2>📱 iPhone</h2><p class="hint">Use ${esc(s.agentName)} like a real app: on your Home Screen, with notifications and Siri.</p><div id="iphoneBody"></div></section>
+    ${s.authEnabled ? `<section class="card" id="security"><h2>Security</h2><p class="hint">Sign in with your fingerprint or face (Windows Hello, Touch ID, Face ID) instead of the password. The key never leaves your device.</p><div id="securityBody" class="hint">Loading…</div></section>` : ''}
+    <section class="card" id="iphone"><h2>iPhone</h2><p class="hint">Use ${esc(s.agentName)} like a real app: on your Home Screen, with notifications and Siri.</p><div id="iphoneBody"></div></section>
 
     <section class="card"><h2>You</h2><p class="hint">${esc(s.agentName)} plans around how you actually live. It also learns these from what you say (“I wake up at 9:30”, “I only run in the evening”).</p>
       <div class="grid2"><label class="f">Your name<input name="userName" value="${esc(s.userName)}"></label><label class="f">Agent name<input name="agentName" value="${esc(s.agentName)}"></label>
         <label class="f">Wake-up (nothing auto-placed before)<input name="dayStart" type="time" value="${esc(s.dayStart)}"></label><label class="f">Wind-down (nothing auto-placed after)<input name="dayEnd" type="time" value="${esc(s.dayEnd)}"></label>
         <label class="f">Longest focus block (min)<input name="focusSpan" type="number" min="25" max="240" step="5" value="${s.focusSpan}"></label><label class="f">Break between blocks (min)<input name="breakMinutes" type="number" min="0" max="60" step="5" value="${s.breakMinutes}"></label>
         <label class="f">Night owl: “tomorrow” said before (empty = off)<input name="nightOwl" type="time" value="${esc(s.nightOwl)}"></label><label class="f">Home city (+ aliases, for trips)<input name="homeCity" value="${esc(s.homeCity)}" placeholder="Boston, Cambridge, BOS"></label>
-        <label class="f">Theme<select id="themeSel"><option value="">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div>
+        <label class="f">Theme<select id="themeSel"><option value="">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label>
+        <div class="f"><label class="f">Signal colour</label><div class="accentpick" id="accentPick">${ACCENTS.map(([id, name, c]) => `<button type="button" data-accent="${id}" aria-label="${name} signal colour"><i style="background:${c}"></i>${name}</button>`).join('')}</div></div></div>
       <label class="f" style="margin-top:12px">When activities happen (one per line: <code>words: times</code>) — enforced whenever ${esc(s.agentName)} picks a time
-        <textarea name="activityWindows" rows="3" placeholder="run, jog: 06:00-08:00, 17:00-21:00&#10;gym: 18:00-22:00">${esc((s.activityWindows || []).map(a => `${a.match}: ${a.windows}`).join('\n'))}</textarea></label></section>
+        <textarea name="activityWindows" rows="3" placeholder="run, jog: 06:00-08:00, 17:00-21:00&#10;gym: 18:00-22:00">${esc((s.activityWindows || []).map(a => `${a.match}: ${a.windows}`).join('\n'))}</textarea></label>
+      <label class="f" style="margin-top:12px">Affirmations on the Today ticker (one per line; empty = the built-in set)
+        <textarea name="affirmations" rows="3" placeholder="${esc(AFFIRMATIONS.slice(0, 3).join('\n'))}">${esc(s.affirmations || '')}</textarea></label></section>
 
     <section class="card" id="cal-conn"><h2>Calendar</h2><p class="hint">Connect your Google Calendar through your own free Apps Script bridge. Nothing else gets access.</p>
       <div class="grid2"><label class="f">Calendar<select name="calendarMode" id="calendarMode"><option value="google" ${s.calendarMode === 'google' ? 'selected' : ''}>My Google Calendar</option><option value="local" ${s.calendarMode !== 'google' ? 'selected' : ''}>Practice calendar (inside this app)</option></select></label></div>
       <div id="googleFields" style="margin-top:12px">
-        ${s.google && !v3 ? `<div class="banner warn" id="upgradeBanner">${ICON.warn}<div><b>Update your bridge to the latest version</b> to unlock recurring-series edits, all your calendars, Meet links, long-range search and email briefings. Two minutes, the URL stays the same:
+        ${s.google && (s.bridgeVersion || 2) < 5 ? `<div class="banner warn" id="upgradeBanner">${ICON.warn}<div><b>Update your bridge to v5</b> so event colours (your priorities) show in Google Calendar${v3 ? '' : ', and to unlock recurring-series edits, all your calendars, Meet links, long-range search and email briefings'}. It also no longer keeps your token in the file you download. Two minutes, the URL stays the same:
           <ol><li>Open <a href="https://script.google.com/home" target="_blank" rel="noopener">script.google.com</a> → your bridge project.</li>
           <li>Replace <b>Code.gs</b> with <button type="button" class="btn sm" data-copy="code">${ICON.copy} Copy Code.gs</button></li>
           <li>Project Settings ⚙ → tick “Show appsscript.json” → replace it with <button type="button" class="btn sm" data-copy="manifest">${ICON.copy} Copy appsscript.json</button></li>
           <li>Run the <b>test</b> function once → Allow.</li>
           <li><b>Deploy → Manage deployments → ✏️ → Version: New version → Deploy.</b> Then press <i>Test connection</i> below.</li></ol></div></div>` : ''}
-        ${v3 ? `<div class="banner info">${ICON.check}<div>Bridge connected${s.userEmail ? ' as <b>' + esc(s.userEmail) + '</b>' : ''}. All features on.</div></div>` : ''}
+        ${v3 && s.bridgeVersion >= 5 ? `<div class="banner info">${ICON.check}<div>Bridge connected${s.userEmail ? ' as <b>' + esc(s.userEmail) + '</b>' : ''}. All features on.</div></div>` : ''}
         <div class="grid2"><label class="f">Bridge URL (ends in /exec)<input name="bridgeUrl" value="${esc(s.bridgeUrl)}" placeholder="https://script.google.com/macros/s/…/exec"></label>
         <label class="f">Bridge token<input name="bridgeToken" type="password" value="${esc(s.bridgeToken)}" placeholder="TOKEN from Code.gs"></label></div>
         <div class="row" style="margin-top:10px"><button class="btn" type="button" id="testBridge">Test connection</button><span class="hint" id="bridgeState"></span></div>
@@ -1013,13 +1335,15 @@ async function renderSettings() {
     </section>
 
     <section class="card"><h2>AI models</h2><p class="hint">${esc(s.agentName)} tries these in order and skips any that are out of free quota, so it keeps working. Add a second free key for extra headroom.</p>
+      <label class="check" style="margin-bottom:10px"><input type="checkbox" name="privateAi" ${s.privateAi === true ? 'checked' : ''}> Private AI (off): never send my calendar to a free service that may train on it or have people read it (Google Gemini's free tier, OpenRouter free models)</label>
       <div>${(s.ai || []).map(p => { const info = PROVIDER_INFO[p.id]; return `<div class="provider"><span class="dot ${p.ready ? (p.blocked ? 'warn' : 'ok') : ''}"></span>
-        <div><b>${info.name}</b> <span class="hint">· ${esc(p.model || '')}${p.callsToday ? ` · ${p.callsToday} call${p.callsToday === 1 ? '' : 's'} today` : ''}</span><div class="hint">${p.blocked ? `Resting until ${new Date(p.blocked.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${esc(p.blocked.why)}` : esc(info.note)}${info.url ? ` <a href="${info.url}" target="_blank" rel="noopener">Get a key</a>` : ''}</div>
+        <div><b>${info.name}</b> <span class="hint">· ${esc(p.model || '')}${p.callsToday ? ` · ${p.callsToday} call${p.callsToday === 1 ? '' : 's'} today` : ''}</span><div class="hint">${p.skipped ? '<b>Skipped: Private AI is on</b> (this free tier may use your prompts for training). ' : ''}${p.blocked ? `Resting until ${new Date(p.blocked.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}: ${esc(p.blocked.why)}` : esc(info.note)}${info.url ? ` <a href="${info.url}" target="_blank" rel="noopener">Get a key</a>` : ''}</div>
         ${info.key ? `<div class="grid2" style="margin-top:6px"><input name="${info.key}" type="password" value="${esc(s[info.key])}" placeholder="API key"><input name="${info.model}" value="${esc(s[info.model])}" placeholder="model"></div>` : `<div class="grid2" style="margin-top:6px"><input name="workersAiModel" value="${esc(s.workersAiModel)}"></div>`}</div>
         <span class="pill ${p.ready ? (p.blocked ? 'warn' : 'good') : ''}">${p.ready ? (p.blocked ? 'resting' : 'ready') : 'off'}</span></div>`; }).join('')}</div>
       <div class="grid2" style="margin-top:10px"><label class="f">Order (first = preferred)<input name="aiOrder" value="${esc((s.aiOrder || []).join(', '))}"></label></div>
       <div class="row" style="margin-top:10px"><button type="button" class="btn sm" id="aiReset">Retry resting models now</button></div>
     </section>
+
 
     <section class="card"><h2>Schedule</h2><p class="hint">Meetings are placed automatically only within meeting hours. Tasks, habits and personal plans may use your waking hours. A time you name yourself always wins.</p>
       <div class="grid2">
@@ -1034,6 +1358,12 @@ async function renderSettings() {
       <label class="f" style="margin-top:12px">High-stakes keywords (get buffers, never bumped)<input name="highStakesKeywords" value="${esc(s.highStakesKeywords)}"></label>
       <label class="f" style="margin-top:12px">Protected keywords (never moved unless you name them)<input name="protectedKeywords" value="${esc(s.protectedKeywords)}"></label>
       <label class="check" style="margin-top:12px"><input type="checkbox" name="meetDefault" ${s.meetDefault ? 'checked' : ''}> Add a Google Meet link to meetings with invited guests</label>
+    </section>
+
+    <section class="card"><h2>Colours &amp; priority</h2><p class="hint">Give an event a colour in chat (“travel to Pune 12–3pm color red”, “make gym yellow”, “laundry low priority”) or in Google Calendar. Higher colours win: booking one over lower-colour events cancels them (one Undo brings them back). Events of the <b>same colour</b> may overlap; they happen together. Events without a colour, and events with other guests, are never cancelled this way.</p>
+      <div class="ladder">${(s.colors || []).map((c, i) => `<span class="swatch" title="${esc(c.name)}"><i style="background:${esc(c.hex)}"></i>${i + 1}. ${esc(c.name)}</span>`).join('')}</div>
+      <label class="f" style="margin-top:12px">Priority order, highest first (colours left out follow in this order)<input name="colorPriority" value="${esc((s.colors || []).map(c => c.name).join(', '))}"></label>
+      <label class="check" style="margin-top:12px"><input type="checkbox" name="priorityCancel" ${s.priorityCancel !== false ? 'checked' : ''}> Cancel lower-priority events I book over (otherwise just tell me)</label>
     </section>
 
     <section class="card"><h2>Autonomy &amp; briefings</h2>
@@ -1061,6 +1391,11 @@ async function renderSettings() {
       ${b.enabled && b.slug ? `<div class="row" style="margin-top:12px"><code>${esc(bookUrl)}</code><button type="button" class="btn sm" id="copyBook">${ICON.copy} Copy link</button><a class="btn sm" href="${esc(bookUrl)}" target="_blank" rel="noopener">Open</a></div>` : ''}
     </section>
 
+    <section class="card" id="health"><h2>Health &amp; backups</h2><p class="hint">How your requests were answered, how often you undid what ${esc(s.agentName)} did, and your backups. A copy of everything is kept inside the database every day for 14 days.</p>
+      <div id="healthBody" class="hint">Loading…</div>
+      <div class="row" style="margin-top:10px"><button type="button" class="btn sm" id="downloadBackup">${ICON.copy} Download a backup (.json, no keys)</button></div>
+    </section>
+
     <section class="card"><h2>Shortcuts</h2><div class="hint" style="line-height:2">
       <span class="kbd">Ctrl</span>+<span class="kbd">K</span> talk to ${esc(s.agentName)} · <span class="kbd">Ctrl</span>+<span class="kbd">J</span> show/hide chat · <span class="kbd">N</span> new event · <span class="kbd">T</span> today · <span class="kbd">←</span> <span class="kbd">→</span> previous/next · <span class="kbd">D</span>/<span class="kbd">W</span> day/week</div>
       <p class="hint">Install on your phone: open this site in Chrome/Safari → Share/⋮ → <b>Add to Home screen</b>.</p></section>
@@ -1068,8 +1403,29 @@ async function renderSettings() {
     <div class="row" style="margin-top:16px"><button class="btn primary">Save settings</button><span class="hint">Time zone: ${esc(s.timeZone)}</span><span class="spacer"></span>${s.authEnabled ? '<button class="btn danger" type="button" id="logoutBtn">Sign out</button>' : ''}</div>
   </form>`;
   const f = $('settingsForm');
+  api('/api/health').then(h => {
+    const tot = h.days.reduce((a, d) => ({ code: a.code + d.code, ai: a.ai + d.ai, failed: a.failed + d.failed, ms: a.ms + d.ms }), { code: 0, ai: 0, failed: 0, ms: 0 });
+    const n = tot.code + tot.ai + tot.failed;
+    const pct = x => n ? Math.round(100 * x / n) + '%' : '–';
+    const rate = (u, t) => t ? `${u} of ${t} (${Math.round(100 * u / t)}%)` : 'none';
+    $('healthBody').innerHTML = `<div class="grid2">
+      <div>Requests (14 days): <b>${n}</b> · answered in code <b>${pct(tot.code)}</b> · by AI <b>${pct(tot.ai)}</b> · failed <b>${pct(tot.failed)}</b></div>
+      <div>Average reply: <b>${n ? (tot.ms / n / 1000).toFixed(1) + ' s' : '–'}</b></div>
+      <div>Undone this week: your requests ${rate(h.undo.chatUndone, h.undo.chat)} · on its own ${rate(h.undo.autoUndone, h.undo.auto)}</div>
+      <div>Last backup: <b>${h.lastBackup ? esc(h.lastBackup) : 'not yet (runs with the 15-minute check)'}</b></div></div>`;
+  }).catch(() => { $('healthBody').textContent = 'Could not load.'; });
+  $('downloadBackup').onclick = async () => {
+    const data = await api('/api/backup');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
+    a.download = `donna-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  };
   $('themeSel').value = store.get('theme', '');
   $('themeSel').onchange = e => { store.set('theme', e.target.value); applyTheme(); };
+  const markAccent = () => $('accentPick').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.accent === store.get('accent', '')));
+  $('accentPick').querySelectorAll('button').forEach(b => b.onclick = () => { store.set('accent', b.dataset.accent); applyTheme(); markAccent(); });
+  markAccent();
   const syncMode = () => { const g = $('calendarMode').value === 'google'; $('googleFields').classList.toggle('hidden', !g); $('localData').classList.toggle('hidden', g); };
   $('calendarMode').onchange = syncMode; syncMode();
   const collect = () => {
@@ -1089,7 +1445,7 @@ async function renderSettings() {
     return data;
   };
   const save = async () => {
-    try { const r = await api('/api/settings', collect()); setStatus(r); toast('Saved'); renderSettings(); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/settings', collect()); setStatus(r); toast('Saved'); renderSettings(); } catch (err) { toast(err.message); }
   };
   f.onsubmit = e => { e.preventDefault(); save(); };
   $('saveTop').onclick = save;
@@ -1097,29 +1453,41 @@ async function renderSettings() {
     $('bridgeState').textContent = 'Testing…';
     try {
       const r = await api('/api/bridge/test', { bridgeUrl: f.bridgeUrl.value, bridgeToken: f.bridgeToken.value, calendarMode: 'google' });
-      $('bridgeState').innerHTML = `✅ ${esc(r.email || 'Connected')} · ${esc(r.timeZone)} · bridge v${r.version}${r.calendars && r.calendars.length ? ` · ${r.calendars.length} calendars` : ''} · ${r.ms} ms`;
+      $('bridgeState').innerHTML = `Connected: ${esc(r.email || 'Connected')} · ${esc(r.timeZone)} · bridge v${r.version}${r.calendars && r.calendars.length ? ` · ${r.calendars.length} calendars` : ''} · ${r.ms} ms`;
       setTimeout(renderSettings, 1500);
-    } catch (err) { $('bridgeState').textContent = '❌ ' + err.message; }
+    } catch (err) { $('bridgeState').textContent = 'Not connected: ' + err.message; }
   };
   f.querySelectorAll('[data-copy]').forEach(btn => btn.onclick = async () => {
     try { const r = await api('/api/bridge/code'); await navigator.clipboard.writeText(btn.dataset.copy === 'code' ? r.code : r.manifest); toast('Copied. Paste it into the Apps Script editor.'); }
-    catch (err) { toast('⚠️ ' + err.message); }
+    catch (err) { toast(err.message); }
   });
   $('aiReset').onclick = async () => { await api('/api/ai/reset', {}); toast('Will retry every model on the next request'); renderSettings(); };
-  $('testEmail')?.addEventListener('click', async () => { try { const r = await api('/api/briefing/send', { kind: 'morning' }); toast(r.ok ? `Sent to ${r.to}` : r.reason); } catch (err) { toast('⚠️ ' + err.message); } });
+  $('testEmail')?.addEventListener('click', async () => { try { const r = await api('/api/briefing/send', { kind: 'morning' }); toast(r.ok ? `Sent to ${r.to}` : r.reason); } catch (err) { toast(err.message); } });
   $('copyBook')?.addEventListener('click', async () => { await navigator.clipboard.writeText(bookUrl); toast('Booking link copied'); });
   $('logoutBtn')?.addEventListener('click', async () => { await fetch('/api/logout', { method: 'POST' }); location.href = '/login.html'; });
   renderIphone(s);
   renderSecurity();
   if (s.google) renderMove();
+  // Contents: a dozen sections on one page need a way in. Numbered like the app's main index.
+  const index = document.createElement('nav');
+  index.className = 'set-index'; index.setAttribute('aria-label', 'Settings sections');
+  [...f.querySelectorAll('section.card > h2')].forEach((h, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    const n = document.createElement('span'); n.textContent = p2(i + 1);
+    b.append(n, document.createTextNode(h.textContent.trim()));
+    b.onclick = () => h.parentElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    index.append(b);
+  });
+  f.prepend(index);
   $('icsFile').onchange = async e => {
     const file = e.target.files[0]; if (!file) return;
-    try { const r = await api('/api/import' + ($('icsReplace').checked ? '?replace=1' : ''), await file.text(), true); toast(`Imported ${r.imported} events`); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/import' + ($('icsReplace').checked ? '?replace=1' : ''), await file.text(), true); toast(`Imported ${r.imported} events`); } catch (err) { toast(err.message); }
     e.target.value = '';
   };
   $('demoBtn').onclick = async () => {
     if (!confirm('Replace the practice calendar with a demo fortnight? (Rules and settings stay.)')) return;
-    try { const r = await api('/api/demo', {}); toast(`Loaded ${r.events} demo events`); loadChat(); } catch (err) { toast('⚠️ ' + err.message); }
+    try { const r = await api('/api/demo', {}); toast(`Loaded ${r.events} demo events`); loadChat(); } catch (err) { toast(err.message); }
   };
 }
 
@@ -1138,7 +1506,7 @@ async function renderSecurity() {
   let r;
   try { r = await api('/api/passkey/list'); } catch (e) { box.textContent = e.message; return; }
   const can = !!window.PublicKeyCredential;
-  box.innerHTML = `<div class="list">${r.keys.map(k => `<div class="li"><div class="body"><div class="ttl">🔑 ${esc(k.name)}</div><div class="hint">Added ${esc(k.created.slice(0, 10))}${k.lastUsed ? ` · last used ${esc(k.lastUsed.slice(0, 10))}` : ''}</div></div><button class="btn sm ghost" type="button" data-pkdel="${esc(k.id)}">Remove</button></div>`).join('') || '<div class="hint">No passkeys yet.</div>'}</div>
+  box.innerHTML = `<div class="list">${r.keys.map(k => `<div class="li"><div class="body"><div class="ttl">${esc(k.name)}</div><div class="hint">Added ${esc(k.created.slice(0, 10))}${k.lastUsed ? ` · last used ${esc(k.lastUsed.slice(0, 10))}` : ''}</div></div><button class="btn sm ghost" type="button" data-pkdel="${esc(k.id)}">Remove</button></div>`).join('') || '<div class="hint">No passkeys yet.</div>'}</div>
     <div class="row" style="margin-top:10px">${can ? `<button class="btn primary" type="button" id="pkAdd">Add this device (${esc(deviceName())})</button>` : '<span class="hint">This browser does not support passkeys.</span>'}
     <button class="btn" type="button" id="revokeAll" title="Every other phone or laptop has to sign in again">Sign out all other devices</button></div>`;
   $('pkAdd')?.addEventListener('click', async e => {
@@ -1157,13 +1525,13 @@ async function renderSecurity() {
         publicKey: b64u(res.getPublicKey()), alg: res.getPublicKeyAlgorithm(), name: deviceName() });
       store.set('passkey', true);
       toast(`Done. Next time, sign in on this ${deviceName()} with your fingerprint or face.`, { ms: 6000 });
-    } catch (err) { toast('⚠️ ' + (err.name === 'InvalidStateError' ? 'This device already has a passkey.' : err.name === 'NotAllowedError' ? 'Cancelled.' : err.message)); }
+    } catch (err) { toast((err.name === 'InvalidStateError' ? 'This device already has a passkey.' : err.name === 'NotAllowedError' ? 'Cancelled.' : err.message)); }
     renderSecurity();
   });
   box.querySelectorAll('[data-pkdel]').forEach(b => b.onclick = async () => { if (!confirm('Remove this passkey? That device will need the password next time.')) return; await api('/api/passkey/remove', { id: b.dataset.pkdel }); renderSecurity(); });
   $('revokeAll')?.addEventListener('click', async () => {
     if (!confirm('Sign out every other phone and laptop? This one stays signed in.')) return;
-    try { await api('/api/sessions/revoke', {}); toast('All other devices are signed out.'); } catch (err) { toast('⚠️ ' + err.message); }
+    try { await api('/api/sessions/revoke', {}); toast('All other devices are signed out.'); } catch (err) { toast(err.message); }
   });
 }
 
@@ -1177,11 +1545,11 @@ async function renderIphone(s) {
   const n = s.notify || {};
   box.innerHTML = `
     <h3 style="font-size:13.5px;margin:6px 0 4px">1 · Home Screen app</h3>
-    ${isStandalone() ? '<div class="hint">✅ You are using the Home Screen app.</div>' : `<div class="hint">In <b>Safari</b> on your iPhone open <code>${esc(origin)}</code>, tap <b>Share</b> (□↑) → <b>Add to Home Screen</b> → Add. Open ${esc(s.agentName)} from the new icon and sign in once; it stays signed in for a year.</div>`}
+    ${isStandalone() ? '<div class="hint">You are using the Home Screen app.</div>' : `<div class="hint">In <b>Safari</b> on your iPhone open <code>${esc(origin)}</code>, tap <b>Share</b> (□↑) → <b>Add to Home Screen</b> → Add. Open ${esc(s.agentName)} from the new icon and sign in once; it stays signed in for a year.</div>`}
     <h3 style="font-size:13.5px;margin:16px 0 4px">2 · Notifications</h3>
     <div class="hint">Morning plan, evening review, changes ${esc(s.agentName)} makes on its own, and new bookings.${isIOS && !isStandalone() ? ' <b>On iPhone, turn them on from the Home Screen app</b> (iOS 16.4 or newer).' : ''}</div>
     <div class="row" style="margin-top:8px">
-      ${pushOk ? `<button type="button" class="btn ${subscribed ? '' : 'primary'}" id="pushOn">${subscribed ? '✅ On for this device' : 'Turn on for this device'}</button>` : '<span class="hint">This browser can\'t receive notifications here.</span>'}
+      ${pushOk ? `<button type="button" class="btn ${subscribed ? '' : 'primary'}" id="pushOn">${subscribed ? 'On for this device' : 'Turn on for this device'}</button>` : '<span class="hint">This browser can\'t receive notifications here.</span>'}
       ${subscribed ? '<button type="button" class="btn" id="pushTest">Send a test</button>' : ''}
     </div>
     <div class="row" style="margin-top:8px">
@@ -1224,7 +1592,7 @@ async function enablePush() {
     toast('Notifications are on for this device');
     await api('/api/push/test', {});
     renderSettings();
-  } catch (err) { toast('⚠️ ' + err.message); }
+  } catch (err) { toast(err.message); }
 }
 
 // ─── Move to another Google account ───
@@ -1264,13 +1632,13 @@ async function renderMove() {
       (m.needsOldUpdate ? '<div class="hint" style="margin-top:6px">Update the old bridge first (see above), then continue.</div>' : '') +
       '<div class="row" style="margin-top:8px"><button type="button" class="btn primary" id="mvClean">Continue</button><span class="hint" id="mvProg"></span></div>');
   } else if (m.stage === 'done') {
-    html = `<div class="banner info" style="display:block">✅ <b>Moved to ${esc(m.email)}.</b> ${m.cleaned} copied items were removed from ${esc(m.oldEmail)}.${m.skippedInvites ? ` ${m.skippedInvites} invitation(s) from other people were left there.` : ''}
+    html = `<div class="banner info" style="display:block"><b>Moved to ${esc(m.email)}.</b> ${m.cleaned} copied items were removed from ${esc(m.oldEmail)}.${m.skippedInvites ? ` ${m.skippedInvites} invitation(s) from other people were left there.` : ''}
       <div style="margin-top:6px">To be sure nothing shows twice on your iPhone: <b>Settings → Calendar → Accounts</b> → if ${esc(m.oldEmail)} is listed, turn its <b>Calendars</b> off. If you had subscribed to the old calendar inside ${esc(m.email)}, untick it in the Calendar app → Calendars.</div></div>`;
   }
   box.innerHTML = html;
   // While moving accounts, the old bridge's upgrade banner only confuses (the move step says if it is needed).
   $('upgradeBanner')?.classList.toggle('hidden', !['idle', 'done', undefined].includes(m.stage));
-  const run = async (btn, fn) => { btn.disabled = true; try { await fn(); } catch (err) { toast('⚠️ ' + err.message, { ms: 7000 }); } btn.disabled = false; renderMove(); };
+  const run = async (btn, fn) => { btn.disabled = true; try { await fn(); } catch (err) { toast(err.message, { ms: 7000 }); } btn.disabled = false; renderMove(); };
   const prog = t => { const p = $('mvProg'); if (p) p.textContent = t; };
   $('mvStart')?.addEventListener('click', e => run(e.target, () => api('/api/move/start', {})));
   $('mvCancel')?.addEventListener('click', e => { if (confirm('Cancel the move? Nothing has been deleted.')) run(e.target, () => api('/api/move/cancel', {})); });
@@ -1302,7 +1670,7 @@ async function renderMove() {
 async function renderMore() {
   topbar('<h1>More</h1>');
   $('view').className = 'view pad';
-  $('view').innerHTML = `<div class="wrap"><div class="card"><div class="list">${['habits', 'insights', 'activity', 'memory', 'settings'].map(v => `<div class="li" style="cursor:pointer" data-go="${v}"><div class="body"><div class="ttl">${TITLES[v]}</div></div>${ICON.right}</div>`).join('')}</div></div>
+  $('view').innerHTML = `<div class="wrap"><div class="card"><div class="list">${['reminders', 'habits', 'insights', 'activity', 'memory', 'settings'].map(v => `<div class="li" style="cursor:pointer" data-go="${v}"><div class="body"><div class="ttl">${TITLES[v]}</div></div>${ICON.right}</div>`).join('')}</div></div>
     <div class="hint" style="text-align:center;margin-top:12px">${esc($('statusText').textContent)}</div></div>`;
   $('view').querySelectorAll('[data-go]').forEach(x => x.onclick = () => setView(x.dataset.go));
 }
@@ -1310,24 +1678,52 @@ async function renderMore() {
 // ─── Chat ───
 const PENDING = ['Thinking…', 'Finding the best times…', 'Making the changes…', 'Double-checking…', 'Almost there…'];
 let feedbackState = {};
+// One change Donna made, as a card: what kind of change, which event, when.
+const CHANGE = [[/^Created/, 'add', '+', 'Added'], [/^Moved/, 'move', '→', 'Moved'], [/^(Cancelled|Declined)/, 'del', '×', null], [/^(Updated|Renamed)/, 'edit', '✎', 'Updated'], [/./, 'edit', '•', null]];
+function parseChange(sum) {
+  const [, cls, ic, label] = CHANGE.find(([re]) => re.test(sum));
+  const verb = label || sum.split(' ')[0];
+  const q = /"([^"]+)"/.exec(sum);
+  const title = q ? q[1] : (sum.split(': ').slice(1).join(': ') || sum);
+  const rest = q ? sum.slice(q.index + q[0].length).replace(/^\s*[·:]\s*/, '').trim() : (/^Cancelled \d+/.test(sum) ? sum.split(':')[0].replace(/^Cancelled /, '') : '');
+  return { cls, ic, verb, title, rest };
+}
 function actionRows(actions) {
   const mine = actions.filter(a => !a.auto), auto = actions.filter(a => a.auto);
+  if (!actions.length) return '';
   const row = a => {
     const st = feedbackState[a.id];
-    return `<div class="act ${st ? 'done' : ''} ${a.auto ? 'auto' : ''}" data-id="${esc(a.id)}"><span class="id">${esc(a.id)}</span><span class="sum">${esc(a.summary)}</span>
-      ${/\(undo of/.test(a.summary) ? '' : `<span class="fb">${st ? `<span class="hint">${esc(st)}</span>` : '<button title="Good — keep doing this" data-v="Good">👍</button><button title="Bad — undo and learn" data-v="Bad">👎</button>'}</span>`}</div>`;
+    const c = parseChange(a.summary);
+    const undoOf = /\(undo of/.test(a.summary);
+    return `<div class="chg ${c.cls} ${st === 'undone' ? 'undone' : ''} ${a.auto ? 'auto' : ''}" data-id="${esc(a.id)}" title="${esc(a.summary)}">
+      <span class="ic">${c.ic}</span>
+      <div class="body"><div class="t"><span class="verb">${esc(c.verb)}</span> ${esc(c.title)}</div>${c.rest ? `<div class="w">${esc(c.rest)}</div>` : ''}</div>
+      ${undoOf ? '' : `<span class="fb">${st ? `<span class="st">${esc(st === 'undone' ? 'Undone' : st === 'good' ? 'Kept' : st === 'bad' ? 'Undone' : st)}</span>` : '<button title="Good call: do more like this" data-v="Good" aria-label="Good">Keep</button><button title="Wrong: undo it and tell me why" data-v="Bad" aria-label="Bad">Wrong</button>'}</span>`}
+    </div>`;
   };
-  if (!actions.length) return '';
   const list = mine.length ? mine : auto;
   const rest = mine.length ? auto : [];
-  const shown = list.slice(0, 6), hidden = [...list.slice(6), ...rest];
-  return `<div class="acts">${shown.map(row).join('')}${hidden.length ? `<button class="more-acts" data-more>+ ${hidden.length} more change${hidden.length === 1 ? '' : 's'}${rest.length && !list.slice(6).length ? ' (automatic)' : ''}</button><div class="hidden">${hidden.map(row).join('')}</div>` : ''}</div>`;
+  const shown = list.slice(0, 5), hidden = [...list.slice(5), ...rest];
+  const live = mine.filter(a => !feedbackState[a.id] && !/\(undo of/.test(a.summary));
+  return `<div class="chgs">${shown.map(row).join('')}${hidden.length ? `<button class="more-acts" data-more>+ ${hidden.length} more${rest.length && !list.slice(5).length ? ' (automatic)' : ''}</button><div class="hidden">${hidden.map(row).join('')}</div>` : ''}</div>
+    ${live.length ? `<div class="msg-tools"><button class="btn sm ghost" data-undo-run="${esc(live.map(a => a.id).join(','))}">Undo${live.length > 1 ? ' all ' + live.length : ''}</button></div>` : ''}`;
+}
+/** The reply minus the lines the change cards already show; "Heads-up" lines become a callout. */
+function replyBody(text, actions, cards = '') {
+  const sums = new Set((actions || []).map(a => a.summary.trim()));
+  const lines = String(text || '').split('\n').filter(l => !sums.has(l.trim()));
+  const heads = lines.filter(l => /^(Heads-up|⚠️)/.test(l.trim()));
+  const body = lines.filter(l => !/^(Heads-up|⚠️)/.test(l.trim())).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  const calls = heads.map(h => `<div class="callout warn">${ICON.warn}<span>${esc(h.trim().replace(/^(Heads-up:\s*|⚠️\s*)/, ''))}</span></div>`).join('');
+  const i = cards.indexOf('<div class="msg-tools">');
+  return (body ? md(body) : '') + (i < 0 ? cards + calls : cards.slice(0, i) + calls + cards.slice(i));
 }
 function addMsg(m) {
   const d = document.createElement('div');
-  d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant') + (m.briefing ? ' briefing' : '');
-  d.innerHTML = (m.role === 'user' ? `<p>${esc(m.text)}</p>` : md(m.text)) + actionRows(m.actions || []) +
-    (m.time ? `<span class="time">${esc(relDay(m.time.slice(0, 10), S.today))} ${clock(m.time)}${m.model ? ' · ' + esc(m.model.split('/').pop()) : ''}</span>` : '');
+  d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant') + (m.briefing ? ' briefing' : '') + (m.auto ? ' auto' : '');
+  const acts = m.actions || [];
+  d.innerHTML = (m.role === 'user' ? `<p>${esc(m.text)}</p>` : replyBody(m.text, acts, actionRows(acts))) +
+    (m.time ? `<span class="time" ${m.model ? `title="Answered by ${esc(m.model)}"` : ''}>${esc(relDay(m.time.slice(0, 10), S.today))} · ${clock(m.time)}</span>` : '');
   $('messages').appendChild(d);
   return d;
 }
@@ -1336,11 +1732,24 @@ async function loadChat() {
   snap.set('chat', { msgs: msgs.slice(-40), acts: acts.slice(0, 120) });
   paintChat(msgs, acts);
 }
+const EXAMPLES = [
+  ['Book', 'Gym tomorrow 7am for an hour'],
+  ['Plan', 'Plan my day: CFA 2h, project 3h, 5k run in the evening'],
+  ['Deadline', 'OS assignment due Friday, about 3 hours'],
+  ['Clear', 'Cancel everything tomorrow after 6pm'],
+  ['Repeat', 'DSA practice every weekday at 7:30pm till 30 Nov'],
+  ['Ask', "When am I free tomorrow for 2 hours?"],
+];
 function paintChat(msgs, acts) {
   feedbackState = {};
   acts.forEach(a => { if (a.status === 'reverted') feedbackState[a.id] = 'undone'; else if (a.feedback) feedbackState[a.id] = a.feedback.split(':')[0]; });
   $('messages').innerHTML = '';
-  if (!msgs.length) addMsg({ role: 'assistant', text: `Hi! I'm ${S.settings.agentName || 'Donna'}. I run your calendar on my own — booking, moving, clearing, recurring plans, study sessions for deadlines, habits — and every change can be undone.\n\nJust tell me what you need, in plain words or Hinglish.` });
+  if (!msgs.length) {
+    const name = esc(S.settings.agentName || 'Donna');
+    $('messages').innerHTML = `<div class="welcome"><div class="wl-logo">${name[0]}</div><h3>What should ${name} do?</h3>
+      <p>Say it the way you'd say it to an assistant. ${name} makes the change in your calendar right away, and every change has an Undo.</p>
+      <div class="wl-grid">${EXAMPLES.map(([k, x]) => `<button class="wl-card" data-ask="${esc(x)}"><span>${esc(k)}</span>${esc(x)}</button>`).join('')}</div></div>`;
+  }
   msgs.forEach(addMsg);
   $('messages').scrollTop = $('messages').scrollHeight;
   renderSuggestions();
@@ -1356,17 +1765,27 @@ document.addEventListener('click', e => {
 });
 $('messages').addEventListener('click', async e => {
   if (e.target.closest('[data-more]')) { const b = e.target.closest('[data-more]'); b.nextElementSibling.classList.remove('hidden'); b.remove(); return; }
+  const ur = e.target.closest('[data-undo-run]');
+  if (ur) { ur.disabled = true; await undoRun(ur.dataset.undoRun.split(',')); return; }
   const btn = e.target.closest('.fb button');
   if (!btn) return;
-  await feedback(btn.closest('.act').dataset.id, btn.dataset.v);
+  await feedback(btn.closest('.chg').dataset.id, btn.dataset.v);
 });
+/** Undo everything one reply changed, newest first. */
+async function undoRun(ids) {
+  let n = 0;
+  for (const id of [...ids].reverse()) { try { await api('/api/feedback', { id, verdict: 'undo', reason: '' }); n++; } catch (err) { toast(err.message); } }
+  if (n) toast(n === 1 ? 'Undone.' : `Undid ${n} changes.`);
+  await loadChat().catch(() => {});
+  render();
+}
 async function feedback(id, verdict) {
   let reason = '';
   if (verdict === 'Bad') {
     reason = prompt(`What was wrong with ${id}? I'll undo it and turn your reason into a rule.\n(Optional, but it makes me smarter.)`, '');
     if (reason === null) return;
   }
-  try { const r = await api('/api/feedback', { id, verdict, reason }); toast(r.text.split('\n')[0]); } catch (err) { toast('⚠️ ' + err.message); }
+  try { const r = await api('/api/feedback', { id, verdict, reason }); toast(r.text.split('\n')[0]); } catch (err) { toast(err.message); }
   await loadChat();
   render();
 }
@@ -1399,7 +1818,7 @@ $('composer').onsubmit = async e => {
     if (S.view !== 'settings') render();
   } catch (err) {
     pending.classList.remove('pending');
-    pending.innerHTML = `<p>⚠️ ${esc(err.message)}</p>`;
+    pending.innerHTML = `<p class="bad-t">${esc(err.message)}</p>`;
     // It may still have finished on the server: pick up the reply if it lands.
     setTimeout(() => loadChat().then(() => render()).catch(() => {}), 8000);
   }
@@ -1439,9 +1858,48 @@ $('closeChat').onclick = () => toggleChat(false);
   };
 })();
 
+// ─── Command bar (Ctrl+K or /): talk to Donna from any screen, see exactly what changed, undo in place ───
+const CMDK_HINTS = ['Move the dentist to Friday 5pm', 'Gym tomorrow 7am for an hour', 'Cancel everything tomorrow after 6pm', 'When am I free on Thursday?', 'Push my next meeting by 30 minutes'];
+function openCmdk(text = '') {
+  if (innerWidth < 980) { ask(text, false); return; }
+  $('cmdk').classList.remove('hidden');
+  $('cmdkInput').value = text;
+  if (!$('cmdkOut').innerHTML) $('cmdkOut').innerHTML = `<div class="cmdk-hints">${CMDK_HINTS.map(h => `<button type="button" data-hint="${esc(h)}">${ICON.spark}${esc(h)}</button>`).join('')}</div>`;
+  setTimeout(() => $('cmdkInput').focus(), 0);
+}
+function closeCmdk() { $('cmdk').classList.add('hidden'); $('cmdkOut').innerHTML = ''; }
+$('cmdk').addEventListener('mousedown', e => { if (e.target === $('cmdk')) closeCmdk(); });
+$('cmdk').addEventListener('keydown', e => { if (e.key === 'Escape') { e.preventDefault(); closeCmdk(); } });
+$('cmdkOut').addEventListener('click', async e => {
+  const h = e.target.closest('[data-hint]');
+  if (h) { $('cmdkInput').value = h.dataset.hint; $('cmdkInput').focus(); return; }
+  const ur = e.target.closest('[data-undo-run]');
+  if (ur) { ur.disabled = true; await undoRun(ur.dataset.undoRun.split(',')); ur.closest('.msg-tools').innerHTML = '<span class="hint">Undone.</span>'; return; }
+  const fb = e.target.closest('.fb button');
+  if (fb) { const card = fb.closest('.chg'); await feedback(card.dataset.id, fb.dataset.v); card.querySelector('.fb').innerHTML = `<span class="st">${fb.dataset.v === 'Good' ? 'Kept' : 'Undone'}</span>`; }
+});
+$('cmdkForm').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('cmdkInput').value.trim();
+  if (!text || sending) return;
+  sending = true;
+  $('cmdkInput').disabled = true;
+  $('cmdkOut').innerHTML = `<div class="cmdk-res"><div class="msg pending"><span class="typing"><i></i><i></i><i></i></span><span>Working on it…</span></div></div>`;
+  try {
+    const r = await api('/api/chat', { message: text }, false, { timeout: 70000 });
+    $('cmdkOut').innerHTML = `<div class="cmdk-res"><div class="q">${esc(text)}</div>${replyBody(r.reply, r.actions || [], actionRows(r.actions || []))}</div>`;
+    $('cmdkInput').value = '';
+    loadChat().catch(() => {});
+    render();
+  } catch (err) { $('cmdkOut').innerHTML = `<div class="cmdk-res"><div class="callout warn">${ICON.warn}<span>${esc(err.message)}</span></div></div>`; }
+  sending = false;
+  $('cmdkInput').disabled = false; $('cmdkInput').focus();
+};
+
 // ─── Keyboard ───
 document.addEventListener('keydown', e => {
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); ask('', false); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); $('cmdk').classList.contains('hidden') ? openCmdk() : closeCmdk(); return; }
+  if (e.key === '/' && !e.target.closest('input, textarea, select, dialog, [contenteditable]')) { e.preventDefault(); openCmdk(); return; }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j') { e.preventDefault(); toggleChat(); return; }
   if (e.target.closest('input, textarea, select, dialog') || e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key.toLowerCase();
@@ -1453,7 +1911,11 @@ document.addEventListener('keydown', e => {
 });
 
 // ─── Theme ───
-function applyTheme() { const t = store.get('theme', ''); if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
+function applyTheme() {
+  const t = store.get('theme', ''), a = store.get('accent', '');
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  if (a) document.documentElement.dataset.accent = a; else delete document.documentElement.dataset.accent;
+}
 applyTheme();
 
 // ─── Boot ───
@@ -1464,6 +1926,8 @@ applyTheme();
   const known = store.get('settings', null);
   if (known) setStatus(known);
   setView(TITLES[v] ? v : 'today', { push: false });
+  // Deep links (home-screen shortcuts): #plan-week, #plan-day, #ask
+  if (v === 'plan-week') setTimeout(openWeekPlanner, 50); else if (v === 'plan-day') setTimeout(() => openPlanner(), 50); else if (v === 'ask') setTimeout(() => openCmdk(), 50);
   renderMini();
   const chatSnap = snap.get('chat');
   if (chatSnap) paintChat(chatSnap.msgs, chatSnap.acts);

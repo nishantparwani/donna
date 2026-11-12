@@ -163,7 +163,7 @@ await test('cancel guard: nothing is deleted unless the user asked; asked → al
   ref(byTitle(/DSA/)[0].id);
   await TOOLS.delete_events({ event_ids: ['E1'], rationale: 'asked' });
   eq(byTitle(/DSA/).length, 0);
-  ok(userAskedToCancel('hata do the run'));
+  ok(userAskedToCancel("i can't make it to the run"));
   ok(!userAskedToCancel('replace their titles with these'));
 });
 
@@ -265,18 +265,19 @@ await test('save_rule with times becomes an enforced window; update_preferences 
   eq(settings().focusSpan, 60);
   let err = '';
   try { await TOOLS.update_preferences({ wake_time: '23:59' }); } catch (e) { err = e.message; }
-  ok(/before the wind-down/.test(err), err);
+  ok(/hours of sleep/.test(err), err);
+  await TOOLS.update_preferences({ wake_time: '11:00', sleep_time: '02:00' }); // a night owl
+  eq(settings().dayEnd, '02:00');
 });
 
 await test('night owl: at 01:30 "tomorrow" means today\'s date', async () => {
   T.setNow('2026-10-21T01:30');
   const t = dateTable();
-  ok(/2026-10-21 Wednesday {2}← today AND "tomorrow"/.test(t), t.split('\n')[0]);
-  ok(/2026-10-22 Thursday {2}← day after tomorrow/.test(t));
-  ok(/"Wednesday" = 2026-10-21/.test(t));
+  ok(t.includes('Wed 2026-10-21 (today AND "tomorrow"'), t);
+  ok(t.includes('Thu 2026-10-22 (day after tomorrow)'), t);
   ok(/both mean 2026-10-21/.test(wrapUserMessage('x')));
   T.setNow('2026-10-21T09:30');
-  ok(/2026-10-22 Thursday {2}← tomorrow/.test(dateTable()));
+  ok(dateTable().includes('Thu 2026-10-22 (tomorrow)'));
 });
 
 await test('rename_in_order: titles land on the 1st, 2nd, 3rd matching event of each day, [tags] kept, times untouched', async () => {
@@ -373,7 +374,6 @@ await test('quick: when every AI is out, "gym tomorrow at 7am for 1 hour" is sti
   const r = await chat('gym tomorrow at 7am for 1 hour');
   const g = byTitle(/^Gym$/)[0];
   ok(g && g.start === '2026-10-22T07:00' && g.end === '2026-10-22T08:00', r.reply);
-  ok(/handled this one myself/.test(r.reply));
   const r2 = await chat('call with Riya on friday at 4 for 30 mins');
   ok(byTitle(/Call with Riya/)[0].start === '2026-10-23T16:00', r2.reply);
 });

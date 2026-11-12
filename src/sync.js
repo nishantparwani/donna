@@ -70,7 +70,7 @@ export function fromBridge(e) {
     description: e.description || '', location: e.location || '', guests: e.guests || [],
     organizer: e.organizer !== false, myStatus: e.myStatus || 'accepted',
     agent: !!m.agent, kind: m.kind || (e.readOnly ? 'busy' : ((e.guests || []).length ? 'meeting' : 'task')), anchor: m.anchor || null,
-    flexible: !!m.flexible, highStakes: !!m.highStakes, protected: !!m.protected,
+    flexible: !!m.flexible, highStakes: !!m.highStakes, protected: !!m.protected, colorSet: !!m.colorSet,
     groupId: m.groupId || '', taskId: m.taskId || '', habitId: m.habitId || '',
     recurringId: e.recurringId || legacySeries, meetLink: e.meetLink || '', reminder: e.reminder ?? null, color: e.color || '',
     calendarId: e.calendarId || 'primary', calendarName: e.calendarName || '', readOnly: !!e.readOnly,

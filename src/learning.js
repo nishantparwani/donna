@@ -6,6 +6,13 @@ import { load, save, settings, saveSettings } from './store.js';
 import { findAction, setAction, revertAction, addRule, addActivityWindow, isAgentBlock, isTimed } from './engine.js';
 import { complete } from './llm.js';
 import { rulePrompt } from './prompt.js';
+import { noteBlock } from './rhythm.js';
+
+/** Good / Undo / Bad on a block Donna placed on its own says whether that hour suits that kind of work. */
+function noteVerdict(a, good) {
+  if (!a.auto || !['create', 'move'].includes(a.type) || !a.after || !a.after.start || a.after.kind === 'buffer' || a.status === 'reverted') return;
+  noteBlock(good, a.after, good ? 0.7 : 1);
+}
 
 const FEEDBACK_RE = /^\s*(ACT-\d+)\s*[:\-–—]?\s*(good|bad|undo|revert)\b\s*[-–—:,.]?\s*(.*)$/i;
 
@@ -25,12 +32,14 @@ export async function applyFeedback(id, verdict, reason) {
   if (!a) return `I couldn't find ${id}.`;
   const mem = load('memory');
   if (verdict === 'good') {
+    if (!/^good/.test(a.feedback || '')) noteVerdict(a, true);
     setAction(a, { feedback: 'good' + (reason ? `: ${reason}` : '') });
     mem.approved.push(`${a.summary} — because ${a.rationale || 'n/a'}${reason ? ` (user: ${reason})` : ''}`);
     mem.approved = mem.approved.slice(-50);
     save('memory');
     return `👍 ${id} noted — I'll keep doing this.`;
   }
+  noteVerdict(a, false);
   // A plain Undo (Today screen): revert it, without turning it into a lesson.
   if (verdict === 'undo') return `↩️ ${a.status === 'reverted' ? `${id} was already undone.` : revertAction(id, 'undone from Today')}`;
   const undo = a.status === 'reverted' ? `${id} was already undone.` : revertAction(id, reason || 'marked bad');

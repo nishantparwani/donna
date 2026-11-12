@@ -4,17 +4,48 @@
   "start_url": "/#today",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#f6f7f9",
-  "theme_color": "#4f46e5",
+  "background_color": "#f3f0e8",
+  "theme_color": "#161513",
   "description": "Your autonomous calendar agent",
   "icons": [
-    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
-    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
-    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
   ],
   "shortcuts": [
-    { "name": "Ask Donna", "url": "/#calendar" },
-    { "name": "Tasks", "url": "/#tasks" }
+    {
+      "name": "Plan my day",
+      "url": "/#plan-day"
+    },
+    {
+      "name": "Plan my week",
+      "url": "/#plan-week"
+    },
+    {
+      "name": "Ask Donna",
+      "url": "/#ask"
+    },
+    {
+      "name": "Tasks",
+      "url": "/#tasks"
+    }
   ]
 }

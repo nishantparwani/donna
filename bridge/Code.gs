@@ -1,5 +1,5 @@
 /**
- * Donna — Google Calendar bridge v4.
+ * Donna — Google Calendar bridge v5 (v5: event colours, which Donna uses as priorities).
  * Lets your agent read your calendars, change events you can edit, copy a calendar between accounts and email you
  * its briefings. Nothing else.
  * Only requests carrying TOKEN are accepted.
@@ -10,8 +10,8 @@
  *   3. Run → function "test" → allow access (once).
  *   4. Deploy → Manage deployments → ✏️ → Version: New version → Deploy.
  */
-const TOKEN = 'CHANGE_ME_to_a_long_random_text';
-const VERSION = 4;
+const TOKEN = 'CHANGE_ME_to_a_long_random_text'; // the app fills in your token when you copy this file from Settings → Calendar
+const VERSION = 5;
 const META = 'agentMeta';
 const CAL = 'primary';
 const MAX_EVENTS = 2500;
@@ -24,7 +24,7 @@ function doGet() {
 function doPost(e) {
   let req;
   try { req = JSON.parse(e.postData.contents); } catch (err) { return out({ error: 'bad request' }); }
-  if (!req || req.token !== TOKEN) return out({ error: 'unauthorized' });
+  if (!req || !same(String(req.token || ''), TOKEN) || TOKEN === '__' + 'TOKEN__') return out({ error: 'unauthorized' });
   if (!fast()) return out({ error: 'Add the "Google Calendar API" service to the bridge project (Services → +), then deploy a new version.' });
   try {
     switch (req.action) {
@@ -44,6 +44,14 @@ function doPost(e) {
   }
 }
 
+/** Constant-time comparison, so the token can't be guessed one character at a time. */
+function same(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
 function out(obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); }
 function fast() { return typeof Calendar !== 'undefined' && !!Calendar.Events; }
 let _tz;
@@ -54,7 +62,7 @@ function rfc(s) { return Utilities.formatDate(parse(s), tz(), "yyyy-MM-dd'T'HH:m
 function addMinutes(s, m) { return fmt(new Date(parse(s).getTime() + m * 60000)); }
 function metaOf(ev) {
   return JSON.stringify({ agent: !!ev.agent, kind: ev.kind, anchor: ev.anchor || null, flexible: !!ev.flexible, highStakes: !!ev.highStakes,
-    protected: !!ev.protected, groupId: ev.groupId || '', taskId: ev.taskId || '', habitId: ev.habitId || '' });
+    protected: !!ev.protected, groupId: ev.groupId || '', taskId: ev.taskId || '', habitId: ev.habitId || '', colorSet: !!ev.colorSet });
 }
 const COLORS = { focus: '10', buffer: '8', task: '5', habit: '2' };
 
@@ -143,7 +151,8 @@ function body(e, withTimes) {
     r.start = { dateTime: rfc(e.start), timeZone: tz() };
     r.end = { dateTime: rfc(e.end), timeZone: tz() };
   }
-  if (e.agent && COLORS[e.kind]) r.colorId = COLORS[e.kind];
+  if (e.color) r.colorId = String(e.color);
+  else if (e.agent && COLORS[e.kind]) r.colorId = COLORS[e.kind];
   if (e.reminder !== null && e.reminder !== undefined && e.reminder !== '') r.reminders = { useDefault: false, overrides: [{ method: 'popup', minutes: Number(e.reminder) }] };
   return r;
 }
@@ -250,6 +259,8 @@ function update(op, cur, seriesId) {
     }
     patch.extendedProperties = { private: { agentMeta: metaOf(e) } };
   }
+  // A colour is personal: it can be set on any event you can see, including invitations.
+  if (e.color && String(e.color) !== String(now.color || '')) patch.colorId = String(e.color);
   if (e.myStatus !== now.myStatus) {
     if (e.myStatus === 'declined') decline(base, target);
     else patch.attendees = (patch.attendees || base.attendees || []).map(a => a.self ? Object.assign({}, a, { responseStatus: 'accepted' }) : a);

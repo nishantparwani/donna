@@ -10,7 +10,7 @@ const FIELDS = {
   organizer: true, kind: 'meeting', agent: false, flexible: false, highStakes: false,
   protected: false, myStatus: 'accepted', anchor: null,
   calendarId: 'primary', calendarName: '', readOnly: false,
-  recurringId: '', recurrence: '', groupId: '', meet: false, meetLink: '', reminder: null, color: '',
+  recurringId: '', recurrence: '', groupId: '', meet: false, meetLink: '', reminder: null, color: '', colorSet: false,
   taskId: '', habitId: '',
 };
 const clone = e => e && structuredClone(e);

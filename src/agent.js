@@ -8,33 +8,41 @@ import * as T from './time.js';
 import * as cal from './calendar.js';
 import { load, save, settings } from './store.js';
 import { generate, OutOfTime } from './llm.js';
-import { TOOL_DECLS, runTool, RUN, beginRun, findAction, TOOLS } from './engine.js';
+import { toolsFor, groupsFor, runTool, RUN, beginRun, findAction, TOOLS } from './engine.js';
 import { plan, findConflicts } from './planner.js';
 import { systemPrompt, wrapUserMessage, autonomousPrompt } from './prompt.js';
 import { handleFeedback } from './learning.js';
 import { ensureRange } from './sync.js';
 import './dayplan.js';
-import { quickAnswer, quickCreate } from './quick.js';
+import { quickAnswer, quickCreate, planText } from './quick.js';
+import { quickReminder } from './reminders.js';
+import { hinglish } from './when.js';
 
-const MAX_STEPS = 8;
-const MAX_CORRECTIONS = 2;
+const MAX_STEPS = 5;
+const MAX_CORRECTIONS = 1;
+const REPLY_TOKENS = 1024;
+const LIST_TOKENS = 4096; // a pasted list comes back as one large tool call
 let CHAT_BUDGET_MS = 40000;     // a reply never takes longer than this; whatever was done by then is reported
 /** Test hook. */
 export function setChatBudget(ms) { CHAT_BUDGET_MS = ms; }
 const CORRECTION_MIN_MS = 12000; // a self-check only runs if there is time left to act on it
-const AUTO_LLM_PER_DAY = 8; // keep the free quota for chat
+const AUTO_LLM_PER_DAY = 2; // keep the free quota for chat
+const AUTO_TOOLS = ['find_free_slots', 'move_event', 'finish'];
+const ONE_THING = /\b(and|then|also|plus|after that|instead|everything|all|each|both|them|those|these|rest|swap|exchange)\b|[,;\n]/i;
 const ASKS_PERMISSION = /\b(should i|shall i|would you like(?: me)? to|do you want(?: me)? to|want me to|let me know if|would you prefer|please confirm|can you confirm|is that (?:ok|okay|alright|fine)|does that work|if you(?:'d| would) like)\b/i;
 const DISAMBIGUATION = /\bwhich (?:one|of)\b/i;
 const CLAIMS_ABSENT = /\b(not (?:scheduled|found|on your calendar|in your calendar)|no (?:upcoming|such|matching|scheduled)|(?:couldn't|could not|can't|cannot) find|don't see|do not see|isn't (?:on|in) your|there (?:is|are) no)\b/i;
 const CLAIMS_FULL =/\b(fully (?:booked|occupied|packed)|no (?:free|open|available) (?:time|slot|slots|space)|no room|completely booked|is full|are full)\b/i;
-const ASKS_FOR_CHANGE = /\b(book|schedule|set up|add|put|move|reschedule|push|pull|shift|bump|cancel|delete|drop|remove|clear|block|decline|undo|revert|make|create|plan|replan|re-plan|rename|retitle|timetable|prepone|postpone|kar do|rakh do|hata do|daal do)\b/i;
+const ASKS_FOR_CHANGE = /\b(book|schedule|set up|add|put|move|reschedule|push|pull|shift|bump|cancel|delete|drop|remove|clear|block|decline|undo|revert|make|create|plan|replan|re-plan|rename|retitle|timetable|prepone|postpone|remind|kar do|rakh do|hata do|daal do)\b/i;
 const EXPLAINS = /\b(can't|cannot|can not|unable|not possible|impossible|already|no free|no room|protected|in the past|isn't|is not|nothing|no such|couldn't|could not|won't|outside|read-only|another calendar|no event)\b/i;
 const CLAIMS_CHANGE = /(^|[.!]\s+|\bI(?:'ve| have)?\s+)(booked|scheduled|moved|rescheduled|created|cancell?ed|deleted|declined|added|blocked|cleared|pushed|shifted|updated|set up|put|removed)\b/i;
 const GREETING = /^\s*(hi|hii+|hello|hey|yo|hola|namaste|good (morning|afternoon|evening)|sup|hey there)( (donna|there|buddy))?\s*[!.]*\s*$/i;
 const THANKS = /^\s*(thanks|thank you|thx|ty|ok|okay|cool|great|nice|perfect|awesome|👍|🙏|👌)+\s*[!.]*\s*$/i;
-const UNDO = /^\s*(undo|undo that|undo it|revert( that)?|put it back|undo the last( one| change)?|undo last( change)?)\s*[.!]*\s*$/i;
+const UNDO = /^\s*(?:(?:no|nope|wait|actually|oops|sorry|hmm)[\s,.]+)*(undo|undo that|undo it|revert( that| it)?|put (it|that|them) back|bring (it|that|them) back|undo the last( one| change)?|undo last( change)?)\s*(please)?\s*[.!]*\s*$/i;
 const UNDO_N = /^\s*undo (?:the )?last (\d+|two|three|four|five)(?: changes?)?\s*[.!]*\s*$/i;
 const WORDS = { two: 2, three: 3, four: 4, five: 5 };
+const QUESTION = /\?\s*$|^\s*(?:what|when|where|which|who|how|is|am|are|do|does|did|can i|could i)\b/i;
+const WRITES = new Set(['create_event', 'create_events', 'move_event', 'update_event', 'update_events', 'delete_events', 'rename_in_order', 'plan_day', 'add_task', 'add_habit']);
 
 /** Google mode: make sure the days a tool is about to touch are loaded. */
 async function preload(a) {
@@ -45,18 +53,18 @@ async function preload(a) {
 async function toolLoop(messages, system, trace, meta) {
   for (let step = 0; step < MAX_STEPS; step++) {
     let out;
-    try { out = await generate({ system, messages, tools: TOOL_DECLS, deadline: meta.deadline }); }
+    try { out = await generate({ system, messages, tools: meta.tools, maxTokens: meta.maxTokens, deadline: meta.deadline }); }
     catch (e) { if (e instanceof OutOfTime) return { text: '', finish: 'TIME' }; throw e; }
     meta.calls++; meta.provider = `${out.provider}/${out.model}`;
     messages.push({ role: 'assistant', content: out.text, calls: out.calls, ...(out.raw && out.raw.gemini ? { _gemini: out.raw.gemini } : {}) });
     if (!out.calls.length) return { text: out.text, finish: 'STOP' };
-    let report = null, allOk = true;
+    let report = null, allOk = true, finished = false;
     // Memory first: "Riya's email is … — book a call with Riya" must invite the address it just learned.
     const first = new Set(['remember_person', 'save_rule']);
     const ordered = [...out.calls.filter(c => first.has(c.name)), ...out.calls.filter(c => !first.has(c.name))];
     for (const c of ordered) {
       let result;
-      if (c.name === 'finish') { report = String((c.args && c.args.report) || '').trim(); result = { ok: true }; }
+      if (c.name === 'finish') { report = String((c.args && (c.args.note || c.args.report)) || '').trim(); finished = true; result = { ok: true }; }
       else {
         try { await preload(c.args || {}); result = await runTool(c.name, c.args || {}); }
         catch (e) { result = { ok: false, error: e.message }; }
@@ -66,8 +74,10 @@ async function toolLoop(messages, system, trace, meta) {
       messages.push({ role: 'tool', callId: c.id, name: c.name, content: result });
     }
     // One-round-trip finish: the model acted and reported in the same turn, and every action succeeded.
-    if (report && allOk) return { text: report, finish: 'FINISH' };
-    if (report && !allOk) messages.push({ role: 'user', content: '<system_check>Some calls failed, so your report was not shown. Fix the failures (or explain them), then call finish again with an accurate report.</system_check>' });
+    if (finished && allOk) return { text: report || '', finish: 'FINISH' };
+    if (finished && !allOk) messages.push({ role: 'user', content: '<system_check>Some calls failed. Fix them or explain why in finish(note).</system_check>' });
+    // A one-thing request that succeeded needs no second model call just to say so.
+    else if (allOk && !meta.auto && RUN.actions.some(a => !a.auto) && !ONE_THING.test(RUN.userText) && !trace.some(t => t.result && t.result.ok === false)) return { text: '', finish: 'FINISH' };
   }
   return { text: '', finish: 'STEP_LIMIT' };
 }
@@ -77,53 +87,61 @@ function critique(res, trace) {
   const text = res.text || '';
   const changed = RUN.actions.some(a => !a.auto);
   const failed = trace.some(t => t.result && t.result.ok === false);
-  if (res.finish === 'STEP_LIMIT') return '<system_check>Too many steps. Stop calling tools that are not needed and call finish with an accurate report now.</system_check>';
-  if (!text || text.length < 2 || /^<\/?[a-z_]+[^>]*>?$/i.test(text)) return '<system_check>Your reply was empty. Complete the request with the tools if anything is left, then call finish with a proper report (§7).</system_check>';
+  if (res.finish === 'STEP_LIMIT') return changed ? null : '<system_check>Too many steps. Call finish now.</system_check>';
+  if (res.finish === 'FINISH' && changed) return null;
+  const silent = !text || text.length < 2 || /^<\/?[a-z_]+[^>]*>?$/i.test(text);
+  if (silent && !changed && !trace.some(t => t.result && (t.result.duplicate || t.result.note || t.result.undone || t.result.result || t.result.ok))) return '<system_check>Your reply was empty. Finish the request, or say in one line why you cannot.</system_check>';
+  if (silent) return null;
   if (!changed && ASKS_PERMISSION.test(text) && !DISAMBIGUATION.test(text)) {
-    return `<system_check>AUTONOMY CHECK FAILED: you asked for permission or offered options and changed nothing. You hold standing authority (§1). Execute the request now with the tools, choosing the best option per §4–§6, then call finish. Only if two existing events genuinely match may you ask a single "which one" question.</system_check>`;
+    return '<system_check>You asked permission and changed nothing. Do it now with the tools, then call finish. Ask only if two different events genuinely fit.</system_check>';
   }
   if (!changed && CLAIMS_CHANGE.test(text) && !trace.some(t => t.result && t.result.ok && (t.result.action_id || t.result.done || t.result.task || t.result.habit || t.result.undone || t.result.result))) {
-    return `<system_check>CLAIM CHECK FAILED: your reply says the calendar changed, but no tool call changed anything. Either do it now with the tools, or rewrite the reply so it only states what is true.</system_check>`;
+    return '<system_check>You said the calendar changed but no tool changed it. Do it now, or correct the reply.</system_check>';
   }
   if (!changed && CLAIMS_ABSENT.test(text) && !trace.some(t => t.tool === 'search_events' || t.tool === 'list_events')) {
-    return `<system_check>UNVERIFIED: you said it is not on the calendar, but <context> only covers 7 days. Call search_events (it covers six months), then answer.</system_check>`;
+    return '<system_check>Context shows only part of the calendar. Call search_events, then answer.</system_check>';
   }
   if (CLAIMS_FULL.test(text) && !trace.some(t => t.tool === 'find_free_slots')) {
-    return `<system_check>UNVERIFIED: you said there is no room but never checked. Agent blocks count as free. Call find_free_slots for the day and window asked, act on the result, then call finish.</system_check>`;
+    return '<system_check>You said there is no room without checking. Call find_free_slots, act on it, then finish.</system_check>';
   }
+  // A clash is the tool's call to make, not a guess from reading the agenda.
+  if (!changed && !QUESTION.test(RUN.userText) && /\b(clash|conflict|overlap|already (?:have|has|booked)|is busy|are busy)/i.test(text) && !trace.some(t => WRITES.has(t.tool))) return '<system_check>Do not refuse over a clash you saw. Call the tool now with the time the user named: it books it and tells the user about any overlap. Then finish.</system_check>';
   if (!changed && ASKS_FOR_CHANGE.test(RUN.userText) && !/\?/.test(text) && !EXPLAINS.test(text) && !failed && !trace.some(t => t.result && t.result.ok && t.tool !== 'list_events' && t.tool !== 'search_events' && t.tool !== 'find_free_slots')) {
-    return `<system_check>INCOMPLETE: the user asked for a change but nothing changed and your reply doesn't say why. Do it now with the tools and call finish. If it truly cannot be done within the rules, say why in one sentence.</system_check>`;
-  }
-  if (changed) {
-    // Every clock time the report states must be one the changes (or the user) actually used.
-    const actual = RUN.actions.filter(a => !a.auto).map(a => a.summary).join(' ') + ' ' + RUN.userText + ' ' + JSON.stringify(trace.map(t => t.result));
-    const said = [...new Set((text.match(/\b([01]?\d|2[0-3]):[0-5]\d\b/g) || []).map(t => t.padStart(5, '0')))];
-    const wrong = said.filter(t => !actual.includes(t));
-    if (wrong.length && RUN.actions.some(a => !a.auto)) {
-      return `<system_check>REPORT CHECK FAILED: your report mentions ${wrong.join(', ')}, but the changes actually made were:\n${RUN.actions.filter(a => !a.auto).map(a => '- ' + a.summary).join('\n')}\nIf that is what the user wanted, call finish again with a report that states exactly these times. If not, fix the calendar first.</system_check>`;
-    }
-    const touched = new Set(), days = new Set();
-    for (const a of RUN.actions) {
-      const rec = findAction(a.id);
-      if (!rec || rec.auto || !['create', 'move'].includes(rec.type)) continue; // renames and notes can't cause a clash
-      if (rec.eventId) touched.add(rec.eventId);
-      for (const snap of [rec.before, rec.after]) if (snap && snap.start && !(rec.extra && rec.extra.count > 1)) days.add(T.day(snap.start));
-    }
-    const refs = [...touched].map(id => RUN.alias.get(id)).filter(Boolean);
-    const problems = [...days].flatMap(findConflicts).filter(c => refs.some(r => c.includes(`${r} "`)));
-    const forced = trace.some(t => t.args && t.args.allow_overlap);
-    if (problems.length && !forced) {
-      return `<system_check>VERIFY CHECK FAILED: events you touched still overlap:\n${problems.map(p => '- ' + p).join('\n')}\nFix these now (move the lower-priority event per §5), then call finish.</system_check>`;
-    }
+    return '<system_check>Nothing changed and you did not say why. Do it now and call finish, or say why in one sentence.</system_check>';
   }
   return null;
 }
 
-async function runAgent(userTurnText, history, budgetMs = CHAT_BUDGET_MS) {
-  const system = systemPrompt();
+/** The reply, written by code from what actually happened: it can't misreport, and it costs no output tokens. */
+function report(res, trace) {
+  const plans = trace.filter(t => t.tool === 'plan_day' && t.result && t.result.ok && t.result.timeline);
+  const lines = plans.length ? [planText(plans[plans.length - 1].result)] : RUN.actions.filter(a => !a.auto).map(a => a.summary);
+  const notes = [];
+  for (const t of trace) {
+    const r = t.result || {};
+    if (r.duplicate && r.note) notes.push(r.note.replace(/, so nothing new was created\. Say so in the report\.$/, '.'));
+    if (r.not_invited) notes.push(r.not_invited.replace(/\. Mention that .*$/, '.'));
+    if (Array.isArray(r.errors)) notes.push(...r.errors.map(e => String(e).replace(/^E\d+: /, '')));
+    if (r.ok === undefined && r.undone) notes.push(...[].concat(r.undone));
+    if (r.undone && r.ok) notes.push(...[].concat(r.undone));
+    if (r.ok && r.result) notes.push(r.result);
+    if (r.ok && r.priority) notes.push(r.priority);
+    if (r.ok && r.overlaps) notes.push(r.overlaps);
+    if (r.ok && r.invited) notes.push(`Invited ${[].concat(r.invited).join(', ')} (they were emailed).`);
+    if (r.ok && r.overlapping_occurrences) notes.push(`Heads-up: ${r.overlapping_occurrences} of ${r.occurrences} overlap something already booked.`);
+    if (r.ok && r.skipped_while_asleep) notes.push(`Skipped ${r.skipped_while_asleep.split(' ')[0]} that fell in your sleeping hours.`);
+  }
+  const text = (res.text || '').trim();
+  const addsToReport = text && text.length <= 300 && !CLAIMS_CHANGE.test(text) && /[a-z]{3}/i.test(text);
+  const body = lines.length ? [...lines, ...notes, ...(addsToReport ? [text] : [])] : (notes.length ? [...notes, ...(text ? [text] : [])] : (text ? [text] : []));
+  return [...new Set(body)].join('\n');
+}
+
+async function runAgent(userTurnText, history, { groups = [], only = null, auto = false } = {}, budgetMs = CHAT_BUDGET_MS) {
+  const system = systemPrompt(groups);
   const messages = [...history, { role: 'user', content: userTurnText }];
   const trace = [];
-  const meta = { calls: 0, provider: '', deadline: Date.now() + budgetMs };
+  const meta = { calls: 0, provider: '', deadline: Date.now() + budgetMs, tools: toolsFor(groups, only), maxTokens: groups.includes('bulk') ? LIST_TOKENS : REPLY_TOKENS, auto };
   let res = await toolLoop(messages, system, trace, meta);
   for (let i = 0; i < MAX_CORRECTIONS && res.finish !== 'TIME' && meta.deadline - Date.now() > CORRECTION_MIN_MS; i++) {
     const fix = critique(res, trace);
@@ -133,7 +151,7 @@ async function runAgent(userTurnText, history, budgetMs = CHAT_BUDGET_MS) {
     if (again.finish === 'TIME' && res.text) break; // keep the answer we had
     res = again;
   }
-  let text = res.text;
+  let text = report(res, trace);
   if (!text) {
     // Out of time or steps: say exactly what was done instead of failing silently.
     const done = RUN.actions.filter(a => !a.auto).map(a => '- ' + a.summary);
@@ -152,12 +170,14 @@ function saveChat(role, text, actions, extra = {}) {
 }
 
 /** Recent turns as neutral messages (starts with a user turn; same-role turns merged). */
-function recentHistory(n = 8) {
+function recentHistory(n = 4) {
   const out = [];
   for (const m of load('chat').messages.slice(-n)) {
+    if (T.diffMin(m.time, T.nowStr()) > 60) continue;
     const role = m.role === 'user' ? 'user' : 'assistant';
-    let text = m.text;
-    if (m.actions && m.actions.length) text += '\n' + m.actions.filter(a => !a.auto).map(a => `${a.id}: ${a.summary}`).join('\n');
+    if (m.auto || m.briefing) continue; // Donna's own notes aren't part of the conversation
+    const limit = role === 'user' ? 300 : 400;
+    const text = m.text.length > limit ? m.text.slice(0, limit) + '…' : m.text;
     if (!out.length && role !== 'user') continue;
     const last = out[out.length - 1];
     if (last && last.role === role) last.content += '\n\n' + text;
@@ -190,6 +210,17 @@ async function fastPath(message) {
     return `${h < 4 ? 'Still up' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'}${s.userName ? ', ' + s.userName.split(' ')[0] : ''}! ${next ? `Next up: ${next.title} at ${T.clock(next.start)}.` : 'Nothing else on your calendar today.'}`;
   }
   if (THANKS.test(message)) return '👍';
+  // "cancel it" with nothing before it to point at: ask, instead of letting the model guess.
+  const bare = /^\s*(?:please\s+)?(cancel|delete|remove|move|reschedule|shift|push|rename)\s+(?:it|that|this|this one|that one)\s*(?:please)?\s*[.!?]*\s*$/i.exec(message);
+  if (bare) {
+    const recent = load('actions').items.slice(-8).some(x => x.status === 'active' && !x.auto && x.source === 'chat' && T.diffMin(x.time, T.nowStr()) <= 60);
+    const last = [...load('chat').messages].reverse().find(m => m.role === 'assistant' && !m.auto);
+    const listed = last && last.listed && last.listed.length && T.diffMin(last.time, T.nowStr()) <= 60;
+    if (!recent && !listed && !RUN.prevUserText) return `Which event should I ${bare[1].toLowerCase()}? Tell me its name or time, e.g. "${bare[1].toLowerCase()} the 4pm tomorrow".`;
+  }
+  // "remind me to X" with no day or time: a reminder (a list, not the calendar).
+  const note = await quickReminder(message);
+  if (note !== null) return note;
   const quick = await quickAnswer(message);
   if (quick !== null) return quick;
   const m = UNDO_N.exec(message);
@@ -203,32 +234,39 @@ async function fastPath(message) {
 
 // ─── Entry points ───
 
-export async function chat(message) {
+/** opts.budgetMs: a shorter time budget for callers that must answer sooner than the default. */
+export async function chat(message, { budgetMs = CHAT_BUDGET_MS } = {}) {
   message = String(message || '').trim().slice(0, 4000);
   if (!message) return { reply: '', actions: [] };
   beginRun('chat');
   const history = recentHistory();
   const { replies, rest } = await handleFeedback(message);
-  RUN.userText = rest;
+  RUN.userText = hinglish(rest);
   // A short follow-up ("no, cancel it dude") refers to the previous request: what it named still counts as named.
   const prev = [...load('chat').messages].reverse().find(m => m.role === 'user');
-  RUN.prevUserText = prev && rest.split(/\s+/).length <= 8 ? prev.text : '';
+  // A follow-up continues a recent conversation, not one from yesterday.
+  RUN.prevUserText = prev && rest.split(/\s+/).length <= 8 && T.diffMin(prev.time, T.nowStr()) <= 60 ? hinglish(prev.text.slice(0, 300)) : '';
   const parts = [...replies];
-  let meta = null, trace = [];
+  let meta = null, trace = [], path = 'none';
+  const began = Date.now();
   if (rest) {
     try {
-      const quick = await fastPath(rest);
-      if (quick !== null) parts.push(quick);
+      const quick = await fastPath(RUN.userText);
+      path = quick !== null ? 'code' : 'ai';
+      if (quick !== null) parts.push([...(!quick || /^(Heads-up|Already|Priority|Runs alongside|Didn't invite|Colours show)/.test(quick) ? RUN.actions.filter(a => !a.auto).map(a => a.summary) : []), quick].filter(Boolean).join('\n'));
       else {
-        const res = await runAgent(wrapUserMessage(rest), history);
+        const groups = groupsFor(rest + ' ' + RUN.prevUserText);
+        const res = await runAgent(wrapUserMessage(rest, { prev: RUN.prevUserText, groups }), history, { groups }, budgetMs);
         parts.push(res.text);
         meta = res.meta; trace = res.trace;
       }
     } catch (e) {
+      path = 'failed';
       // No AI available: simple "X tomorrow at 7" requests are still handled in code.
       let saved = null;
-      if (/AI model|quota|unavailable/i.test(e.message)) { try { saved = await quickCreate(rest); } catch (err) { saved = '⚠️ ' + err.message; } }
-      parts.push(saved || '⚠️ ' + e.message);
+      if (/AI model|quota|unavailable/i.test(e.message)) { try { saved = await quickCreate(RUN.userText); } catch (err) { saved = '⚠️ ' + err.message; } }
+      const done = RUN.actions.filter(a => !a.auto).map(a => a.summary);
+      parts.push([...done, saved || '⚠️ ' + e.message].join('\n'));
     }
   }
   if ((RUN.actions.length || RUN.planNeeded) && settings().autonomous) {
@@ -236,8 +274,9 @@ export async function chat(message) {
   }
   const reply = clean(parts.join('\n\n'));
   const actions = RUN.actions.slice();
-  saveChat('user', message);
-  saveChat('assistant', reply, actions, meta ? { model: meta.provider } : {});
+  noteMetric(path, Date.now() - began, meta && meta.provider);
+  saveChat('user', message, []);
+  saveChat('assistant', reply, actions, { ...(meta ? { model: meta.provider } : {}), ...(RUN.listed && RUN.listed.length ? { listed: RUN.listed.slice(0, 30) } : {}) });
   return { reply, actions, model: meta && meta.provider, trace };
 }
 
@@ -257,14 +296,14 @@ export async function autoRun({ force = false, label = '' } = {}) {
   if (needAi.length && !repeat && (budget.n < AUTO_LLM_PER_DAY || force)) {
     budget.n++; st.autoLlm = budget;
     st.lastIssues = sig; st.lastIssuesAt = Date.now(); save('state');
-    try { text = (await runAgent(autonomousPrompt(needAi, s.planDaysAhead), [])).text; }
+    try { text = (await runAgent(autonomousPrompt(needAi, s.planDaysAhead), [], { only: AUTO_TOOLS, auto: true })).text; }
     catch (e) { text = '⚠️ Auto-check could not use the AI: ' + e.message; }
     if (RUN.actions.some(a => !a.auto)) await plan();
   }
   const actions = RUN.actions.slice();
   const visible = actions.filter(a => !a.auto || /^(Moved|Cancelled)/.test(a.summary));
   const summary = text || (label ? `${label}: ${actions.length ? `${actions.length} change${actions.length === 1 ? '' : 's'}` : 'everything already fits'}.` : `Kept your plan in shape: ${actions.length} automatic change${actions.length === 1 ? '' : 's'}.`);
-  if (text || visible.length || label) saveChat('assistant', '🤖 ' + (label && text ? label + '. ' : '') + summary, actions, { auto: true });
+  if (text || visible.length || label) saveChat('assistant', (label && text ? label + '. ' : '') + summary, actions, { auto: true });
   st.lastAutoRun = T.nowStr(); save('state');
   return { text, actions, issues };
 }
@@ -276,3 +315,21 @@ export function appendToLastReply(note) {
   if (m) { m.text += '\n\n' + note; save('chat'); }
 }
 export { saveChat };
+
+/**
+ * Daily counters for Settings → Health: how requests were answered (code / AI / failed) and how long they took.
+ * Kept for 30 days in state (no extra row, no extra write).
+ */
+function noteMetric(path, ms, provider) {
+  if (path === 'none') return;
+  const st = load('state');
+  const m = st.metrics && typeof st.metrics === 'object' ? st.metrics : {};
+  const d = T.today();
+  const row = m[d] || (m[d] = { code: 0, ai: 0, failed: 0, ms: 0, slow: 0 });
+  row[path]++; row.ms += ms; if (ms > 10000) row.slow++;
+  if (provider) { row.by = row.by || {}; row.by[provider.split('/')[0]] = (row.by[provider.split('/')[0]] || 0) + 1; }
+  for (const k of Object.keys(m).sort().slice(0, -30)) delete m[k];
+  st.metrics = m;
+  save('state');
+  if (typeof process === 'undefined') console.log(JSON.stringify({ event: 'chat', path, ms, provider: provider || '' })); // Workers Logs
+}

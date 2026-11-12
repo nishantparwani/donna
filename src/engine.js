@@ -3,11 +3,15 @@
 import * as T from './time.js';
 import * as cal from './calendar.js';
 import { load, save, settings, saveSettings } from './store.js';
-import { googleMode, hasV3, searchRemote, ensureRange, loadedRange } from './sync.js';
+import { googleMode, hasV3, searchRemote, ensureRange, loadedRange, bridgeVersion } from './sync.js';
+import { colorId, colorIn, colorName, relation, sameColor, userColor } from './colors.js';
 import { demandOf, scoreSlot, freeAround, reasonFor } from './smart.js';
+import { rhythmBias, noteBlock } from './rhythm.js';
+import { datesIn, contentWords, timeIn, dayPart } from './when.js';
 
 const MAX_WRITES_PER_RUN = 40;
 const MAX_SERIES_EVENTS = 300;
+const MAX_BULK_DELETE = 400;
 
 // ─── Per-run context ───
 export const RUN = { id: '', writes: 0, source: 'chat', actions: [], userText: '', inPlanner: false, alias: new Map(), real: new Map(), planNeeded: false };
@@ -15,14 +19,16 @@ let runSeq = 0;
 export function beginRun(source, userText = '') {
   // One id per user request, so "undo that" can revert everything that one request changed.
   const id = Date.now().toString(36) + (++runSeq).toString(36);
-  Object.assign(RUN, { id, writes: 0, source, actions: [], userText, prevUserText: '', inPlanner: false, alias: new Map(), real: new Map(), planNeeded: false });
+  Object.assign(RUN, { id, writes: 0, source, actions: [], listed: [], userText, prevUserText: '', inPlanner: false, alias: new Map(), real: new Map(), planNeeded: false });
 }
 /** Did the user's own message ask to cancel / delete / decline something? Nothing is cancelled otherwise. */
-export const userAskedToCancel = (text = RUN.userText) => /\b(cancel+(?:ed|led|s)?|delete[sd]?|remove[sd]?|drop(?:ped)?|scrap|decline|erase|get rid|wipe|call(?:ed)? off|don'?t need|no longer|not (?:going|attending|happening)|skip(?:ping)?|hata(?:o|do| do)?|mita(?:o| do)?|nikal(?:o| do)?|band kar|rad+ kar)\b/i.test(text || '');
+export const userAskedToCancel = (text = RUN.userText) => /\b(cancel+(?:ed|led|s)?|clear (?:out |off )?(?:my|the|all|everything|tomorrow|today|tonight|this|next|[a-z]+day)|empty (?:my|the)|delete[sd]?|remove[sd]?|drop(?:ped)?|scrap|decline|erase|get rid|wipe|kill|nuke|trash|take (?:it|that|them) off|call(?:ed)? off|don'?t need|do not need|no need|not needed|no longer|not (?:going|attending|happening)|can'?t (?:make|attend|go)|cannot (?:make|attend|go)|won'?t (?:make|attend|go)|skip(?:ping)?)\b/i.test(text || '');
+/** This message, or the one it follows up on ("the vendor one", "and the run too"), asked to cancel. */
+const cancelRequested = () => userAskedToCancel(RUN.userText) || (!!RUN.prevUserText && userAskedToCancel(RUN.prevUserText));
 /** Did the user say the times must stay as they are (e.g. "rename … keep the existing times")? */
-export const userSaidKeepTimes = (text = RUN.userText) => /\b(?:keep|same|don'?t (?:change|touch|move)|without (?:changing|moving))\b[^.\n]{0,40}\b(?:times?|timings?|slots?|schedule)\b|\btimes? (?:un ?changed|as (?:they are|is))\b|\bdon'?t (?:move|reschedule) (?:them|anything|any)\b/i.test(text || '');
+export const userSaidKeepTimes = (text = RUN.userText) => /\b(?:keep|don'?t (?:change|touch|move)|without (?:changing|moving))\b[^.\n]{0,40}\b(?:times?|timings?|slots?|schedule)\b|\btimes? (?:un ?changed|as (?:they are|is))\b|\bdon'?t (?:move|reschedule) (?:them|anything|any)\b/i.test(text || '');
 /** Did the user's message name a time of day? Then they may place things outside the usual hours. */
-export const userGaveTime = (text = RUN.userText) => /\b\d{1,2}[:.]\d{2}\b|\b\d{1,2}\s*(am|pm|a\.m\.|p\.m\.)|\bat\s+\d|\b\d+\s*(min|mins|minutes?|hours?|hrs?|ghante?|ghanta)\b|\bevery\b|morning|afternoon|evening|night|midnight|noon|midday|lunch|\beod\b|early|late|first thing|subah|shaam|dopahar|raat|baje|emergency/i.test(text || '');
+export const userGaveTime = (text = RUN.userText) => /\bto \d{1,2}\b|\b(?:make it|start at|starts at|by) \d|\b\d{1,2}[:.]\d{2}\b|\b\d{1,2}\s*(am|pm|a\.m\.|p\.m\.)|\bat\s+\d|\b\d+\s*(min|mins|minutes?|hours?|hrs?|ghante?|ghanta)\b|\bevery\b|morning|afternoon|evening|night|midnight|noon|midday|lunch|\beod\b|early|late|first thing|emergency/i.test(text || '');
 /** The one length the user stated ("for 10 mins", "90 minutes", "half an hour"), or 0. Ignores "every 2 hours" / "in 2 hours". */
 export function userGaveDuration(text = RUN.userText) {
   const t = String(text || '').toLowerCase();
@@ -39,13 +45,20 @@ export function userGaveDuration(text = RUN.userText) {
 
 /** The one clock time the user stated ("7:30pm", "19:30", "at 6 pm"), as HH:MM, or '' (none or several). */
 export function userGaveClock(text = RUN.userText) {
-  const t = String(text || '').toLowerCase();
+  // "12 noon till 3pm" is a range, not one time.
+  const t = String(text || '').toLowerCase().replace(/\b(?:12\s*)?noon\b|\bmidday\b/g, '12pm').replace(/\b(?:12\s*)?midnight\b/g, '12am');
+  if (/\b\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm)?\s*(?:to|till|until|-|–)\s*\d/.test(t)) return '';
   const found = new Set();
   for (const m of t.matchAll(/\b(\d{1,2})[:.](\d{2})\s*(am|pm|a\.m\.|p\.m\.)?|\b(\d{1,2})\s*(am|pm|a\.m\.|p\.m\.)/g)) {
     const h = Number(m[1] ?? m[4]), mi = Number(m[2] || 0), ap = m[3] || m[5] || '';
     if (h > 23 || mi > 59) continue;
+    if (!ap && h <= 12) { const c = timeIn(`at ${h}:${String(mi).padStart(2, '0')}`, { part: dayPart(t) }); if (c) { found.add(T.toHM(c.minutes)); continue; } }
     const hh = /p/.test(ap) && h < 12 ? h + 12 : /a/.test(ap) && h === 12 ? 0 : h;
     found.add(`${String(hh).padStart(2, '0')}:${String(mi).padStart(2, '0')}`);
+  }
+  if (!found.size) {
+    const bareHour = t.match(/\bat\s+\d{1,2}\b/g);
+    if (bareHour && bareHour.length === 1) { const c = timeIn(t, { part: dayPart(t) }); if (c) found.add(T.toHM(c.minutes)); }
   }
   return found.size === 1 ? [...found][0] : '';
 }
@@ -56,7 +69,7 @@ export function ref(id) {
   if (!RUN.alias.has(id)) { const a = 'E' + (RUN.alias.size + 1); RUN.alias.set(id, a); RUN.real.set(a, id); }
   return RUN.alias.get(id);
 }
-export const realId = x => { const s = String(x || '').trim(); return RUN.real.get(s.toUpperCase()) || s; };
+export const realId = x => { const s = String(x || '').trim(); return RUN.real.get(s) || (/^E\d+$/i.test(s) ? RUN.real.get(s.toUpperCase()) : '') || s; };
 
 // ─── Classification ───
 const kwList = s => String(s || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -68,8 +81,11 @@ export const isActive = e => e.myStatus !== 'declined';
 /** Blocks the agent placed itself; they yield to real commitments and get re-planned. */
 export const isAgentBlock = e => !!e.agent && SOFT.includes(e.kind) && (e.kind === 'buffer' || e.kind === 'focus' || !!e.taskId || !!e.habitId);
 export const isTimed = e => !e.allDay && isActive(e);
-/** Short solo events (≤15 min, no guests) are reminders: they never block time or count as clashes. */
-export const isPing = e => !e.allDay && !(e.guests || []).length && !e.readOnly && T.diffMin(e.start, e.end) <= 15 && !['buffer', 'meeting'].includes(e.kind);
+/** The weekly "Reminders: a + b + c" event (src/reminders.js) is recognised by this line in its notes. */
+export const REMINDER_LIST_MARK = 'Kept up to date by Donna from your Reminders.';
+export const isReminderList = e => String(e.description || '').includes(REMINDER_LIST_MARK);
+/** Short solo events (≤15 min, no guests) and the weekly reminder list never block time or count as clashes. */
+export const isPing = e => isReminderList(e) || !e.allDay && !(e.guests || []).length && !e.readOnly && T.diffMin(e.start, e.end) <= 15 && !['buffer', 'meeting'].includes(e.kind);
 export function isHighStakes(e, s = settings()) {
   if (isAgentBlock(e)) return false;
   const t = textOf(e);
@@ -88,20 +104,16 @@ const guestCount = e => (e.guests || []).length;
 /** Compact, model-facing view of an event. */
 export function describe(e) {
   const s = settings();
-  const d = { id: ref(e.id), title: e.title, start: e.start, end: e.end, minutes: T.diffMin(e.start, e.end), kind: e.kind };
+  const d = { id: ref(e.id), title: e.title, start: e.start, end: e.end };
   if (e.allDay) d.allDay = true;
   if (guestCount(e)) d.guests = guestCount(e);
   if (!e.organizer && !e.readOnly) d.invite = true;
   if (e.readOnly) d.otherCalendar = e.calendarName || true;
-  if (e.agent) d.agentMade = true;
   if (e.recurringId) d.recurring = true;
   if (e.groupId) d.group = true;
-  if (isHighStakes(e, s)) d.highStakes = true;
   if (isProtected(e, s)) d.protected = true;
-  if (isFlexible(e)) d.flexible = true;
-  if (e.location) d.location = e.location;
-  if (e.meetLink) d.meet = true;
   if (!isActive(e)) d.declined = true;
+  if (userColor(e)) d.color = colorName(userColor(e));
   return d;
 }
 
@@ -112,7 +124,7 @@ function summarize(type, b, a, extra = {}) {
   switch (type) {
     case 'create': return extra.count > 1 ? `Created "${t}"${n}, first ${T.span(a.start, a.end)}${extra.repeat ? ' · ' + extra.repeat : ''}` : `Created "${t}" · ${T.span(a.start, a.end)}`;
     case 'move': return `Moved "${t}"${extra.scope === 'series' ? ' (whole series)' : ''} · ${T.span(b.start, b.end)} → ${T.span(a.start, a.end)}`;
-    case 'delete': return `Cancelled "${t}"${extra.scope === 'series' ? ' (whole series)' : ''}${n} · ${T.span(b.start, b.end)}`;
+    case 'delete': return extra.scope === 'bulk' ? `Cancelled ${extra.count} event${extra.count === 1 ? '' : 's'}: ${extra.titles}` : `Cancelled "${t}"${extra.scope === 'series' ? ' (whole series)' : ''}${n} · ${T.span(b.start, b.end)}`;
     case 'decline': return `Declined "${t}"${extra.scope === 'series' ? ' (whole series)' : ''} · ${T.span(b.start, b.end)}`;
     case 'update': return `Updated "${t}"${extra.scope === 'series' ? ' (whole series)' : ''}`;
     default: return `${type} "${t}"`;
@@ -128,9 +140,9 @@ export function logAction(type, before, after, rationale, extra = {}) {
   // Snapshots are stored without default-valued fields: the log is read on every request.
   if (extra.snapshots) extra = { ...extra, snapshots: extra.snapshots.map(cal.compact) };
   log.items.push({ id, time: T.nowStr(), type, title: r.title || '', eventId: r.id || '', before: cal.compact(before), after: cal.compact(after), extra,
-    rationale: rationale || '', summary, status: 'active', feedback: '', source: RUN.source, auto, run: RUN.id });
+    rationale: rationale || RUN.userText.slice(0, 120), summary, status: 'active', feedback: '', source: RUN.source, auto, run: RUN.id });
   save('actions');
-  RUN.actions.push({ id, summary, rationale: rationale || '', auto });
+  RUN.actions.push({ id, summary, rationale: rationale || RUN.userText.slice(0, 120), auto });
   return id;
 }
 export const findAction = id => load('actions').items.find(a => a.id === String(id).trim().toUpperCase());
@@ -146,8 +158,25 @@ const meetingKinds = ['meeting'];
 /** The window a kind of event may be auto-placed in on day d, or null if not on that day. */
 export function windowFor(d, kind, s = settings()) {
   if (meetingKinds.includes(kind)) return s.workDays.includes(T.dow(d)) ? [T.hm(s.workStart), T.hm(s.workEnd)] : null;
-  return [T.hm(s.dayStart), T.hm(s.dayEnd)];
+  const [lo, hi] = [T.hm(s.dayStart), T.hm(s.dayEnd)];
+  return [lo, hi > lo ? hi : 1440]; // a night owl's day runs to midnight here; awakeRanges adds the hours after it
 }
+/**
+ * Waking hours on a calendar date as minute ranges. Someone up 11:00–02:00 is awake 00:00–02:00 (the end of the
+ * previous evening) and 11:00–24:00 on every date; an ordinary 07:00–23:00 day is one range.
+ */
+export function awakeRanges(s = settings()) {
+  const lo = T.hm(s.dayStart), hi = T.hm(s.dayEnd);
+  if (hi > lo) return [[lo, hi]];
+  return hi > 0 ? [[0, hi], [lo, 1440]] : [[lo, 1440]];
+}
+/** Is [start, end) inside waking hours? */
+export function isAwake(start, end, s = settings()) {
+  const a = T.mins(start), b = T.day(end) === T.day(start) ? (T.mins(end) || 1440) : 1440 + T.mins(end);
+  return awakeRanges(s).some(([x, y]) => a >= x && b <= y) || (T.hm(s.dayEnd) <= T.hm(s.dayStart) && a >= T.hm(s.dayStart) && b <= 1440 + T.hm(s.dayEnd));
+}
+/** End of the user's day on date d (a night owl's day ends after midnight; a deadline on d then means 23:59). */
+export const dayEndOn = (d, s = settings()) => T.hm(s.dayEnd) > T.hm(s.dayStart) ? `${d}T${s.dayEnd}` : `${d}T23:59`;
 
 /** "06:00-08:00, 17:00-21:00" → [[360, 480], [1020, 1260]] (invalid parts are dropped). */
 export function parseWindows(text) {
@@ -176,30 +205,107 @@ export function activityWindows(title, s = settings()) {
 const inAnyWindow = (start, end, ws) => ws.some(([a, b]) => T.mins(start) >= a && (T.day(end) === T.day(start) ? T.mins(end) || 1440 : 1440) <= b);
 
 /** Returns '' if [start,end) is allowed, else a precise, actionable error for the model. */
-export function checkPlacement(start, end, { ignore = [], kind = 'meeting', explicit = false, allowOverlap = false, title = '' } = {}) {
+export function checkPlacement(start, end, { ignore = [], kind = 'meeting', explicit = false, allowOverlap = false, title = '', color = '' } = {}) {
   const s = settings();
   if (!(end > start)) return 'End must be after start.';
   if (start < T.addMin(T.nowStr(), -5)) return `${T.human(start)} is in the past (now is ${T.human(T.nowStr())}).`;
   if (!explicit) {
     const w = windowFor(T.day(start), kind, s);
     if (!w) return `${T.DAY_NAMES[T.dow(T.day(start))]} is not a working day, so meetings are not placed there unless the user names that day and time.`;
-    if (T.day(start) !== T.day(end) || T.mins(start) < w[0] || (T.mins(end) || 1440) > w[1])
+    const inside = kind === 'meeting' ? !(T.day(start) !== T.day(end) || T.mins(start) < w[0] || (T.mins(end) || 1440) > w[1]) : isAwake(start, end, s);
+    if (!inside)
       return `Outside the allowed hours ${T.toHM(w[0])}–${T.toHM(w[1])} for a ${kind}. Pick a time inside them (find_free_slots), unless the user named this exact time.`;
     const act = title && activityWindows(title, s);
     if (act && !inAnyWindow(start, end, act.windows))
       return `The user only does "${act.match}" at ${act.label}. Pick a time inside that (find_free_slots with title), unless the user named this exact time.`;
   }
-  const clashes = T.diffMin(start, end) <= 15 && kind !== 'meeting' ? [] : clashesWith(start, end, ignore); // a reminder may sit on top of anything
-  if (clashes.length && !allowOverlap) {
+  const clashes = T.diffMin(start, end) <= 15 && kind !== 'meeting' ? [] : clashesWith(start, end, ignore, { color }); // a reminder may sit on top of anything
+  // A time the user named is theirs to choose: it is booked, and the overlap is reported (overlapNote).
+  if (clashes.length && !allowOverlap && !(explicit && namedTime())) {
     return 'Overlaps ' + clashes.map(e => `${ref(e.id)} "${e.title}" ${T.clock(e.start)}–${T.clock(e.end)}${isProtected(e) ? ' (protected)' : ''}`).join(', ') +
       '. Choose a free time (find_free_slots) or first move the lower-priority event.';
   }
   return '';
 }
-/** Real commitments overlapping [start, end). Agent blocks yield, so they never count. */
-export function clashesWith(start, end, ignore = []) {
+/** The user's own message named a clock time (or "noon"/"midnight"), so the time is not ours to second-guess. */
+const namedTime = () => RUN.source === 'chat' && /\d|noon|midnight/.test(RUN.userText || '');
+/** "swap the dentist and the passport renewal": each takes the other's time, so they overlap for a moment. */
+const SWAP = /\b(swap|switch|exchange|interchange)\b/i;
+/** "Heads-up: this overlaps AI Lecture (15:00–16:00)." or undefined; told to the user after booking at a time they named. */
+export function overlapNote(start, end, ignore = [], color = '') {
+  if (T.diffMin(start, end) <= 15) return undefined;
+  // With a colour, coloured overlaps are priority matters that applyPriority reports.
+  const c = clashesWith(start, end, ignore, { color, uncolored: !!color });
+  return c.length ? 'Heads-up: this overlaps ' + c.slice(0, 3).map(e => `${e.title} (${T.day(e.start) !== T.day(start) ? T.human(e.start) : T.clock(e.start)}–${T.clock(e.end)})`).join(', ') + '.' : undefined;
+}
+/**
+ * Real commitments overlapping [start, end). Agent blocks yield, so they never count; nor do events of the
+ * same colour as `color` (they are simultaneous). With a colour, other coloured events are priority matters
+ * (applyPriority reports them), so overlap notes only list uncoloured ones.
+ */
+export function clashesWith(start, end, ignore = [], { color = '', uncolored = false } = {}) {
   const skip = new Set(ignore);
-  return cal.list(start, end).filter(e => isTimed(e) && !skip.has(e.id) && !isAgentBlock(e) && !(e.agent && e.kind === 'buffer') && !isPing(e));
+  return cal.list(start, end).filter(e => isTimed(e) && !skip.has(e.id) && !isAgentBlock(e) && !(e.agent && e.kind === 'buffer') && !isPing(e)
+    && !(color && sameColor(e, { color })) && !(uncolored && userColor(e)));
+}
+
+/**
+ * Colour priorities after `ev` is placed (just created or moved at the user's request):
+ *   • lower-priority events it overlaps are cancelled, if the user owns them and nobody else is on them
+ *     (cancelling a shared event would email the guests, so those are only reported);
+ *   • events of the same colour run alongside it (simultaneous);
+ *   • higher-priority ones are reported.
+ * cancel = false: report only.
+ */
+export function applyPriority(ev, { cancel = true } = {}) {
+  if (!ev || !userColor(ev) || ev.allDay) return {};
+  const out = { cancelled: [], alongside: [], kept: [], above: [] };
+  const allow = cancel && settings().priorityCancel !== false;
+  for (const e of cal.list(ev.start, ev.end)) {
+    if (e.id === ev.id || !isTimed(e) || isAgentBlock(e) || (e.agent && e.kind === 'buffer') || e.end <= T.nowStr()) continue;
+    const rel = relation(ev, e);
+    if (rel === 'same') out.alongside.push(e.title);
+    else if (rel === 'lower') out.above.push(`${e.title} (${colorName(e.color)})`);
+    else if (rel === 'higher') {
+      const guests = (e.guests || []).length > 0, mine = e.organizer && !e.readOnly;
+      if (!allow || guests || !mine) {
+        out.kept.push(`${e.title} (${colorName(e.color)}${guests ? '; it has guests, so cancelling it would email them' : !mine ? '; not yours to cancel' : ''})`);
+        continue;
+      }
+      markWrite();
+      removeOne(e, false, `Lower priority (${colorName(e.color)}) than "${ev.title}" (${colorName(ev.color)})`);
+      out.cancelled.push(`${e.title} (${colorName(e.color)}, ${T.clock(e.start)}–${T.clock(e.end)})`);
+    }
+  }
+  const lines = [];
+  if (out.cancelled.length) lines.push(`Priority ${colorName(ev.color)}: cancelled the lower-priority ${out.cancelled.join(', ')}. Undo brings ${out.cancelled.length === 1 ? 'it' : 'them'} back.`);
+  if (out.kept.length) lines.push(`Priority ${colorName(ev.color)}: overlaps lower-priority ${out.kept.join(', ')}. Left as is${allow ? '' : '; say "cancel" with its name to remove it'}.`);
+  if (out.alongside.length) lines.push(`Runs alongside ${out.alongside.join(', ')} (same colour, so they happen together).`);
+  if (out.above.length) lines.push(`Heads-up: overlaps higher-priority ${out.above.join(', ')}.`);
+  if (googleMode() && bridgeVersion() < 5) lines.push('Colours show in Google Calendar once the bridge is updated (Settings → Calendar).');
+  return { note: lines.join('\n') || undefined, cancelled: out.cancelled };
+}
+/** The colour the user named in this request ("color red", "in yellow", "high priority"), else ''. */
+export const userGaveColor = (text = RUN.userText) => colorIn(text || '').color;
+
+/** Stops the model acting on a lookalike ("move the marathon" → Run) or guessing what "it" means with nothing to go on. */
+function guardTarget(ev) {
+  if (RUN.source !== 'chat' || !RUN.userText || RUN.inPlanner) return;
+  const msg = RUN.userText;
+  if (/\b(everything|all|clear|free up|make room|conflicts?|emergency|after|before)\b/i.test(msg)) return; // sweeps name no single event
+  if (load('actions').items.slice(-12).some(x => x.status === 'active' && !x.auto && x.source === 'chat' && (x.after || x.before || {}).id === ev.id && T.diffMin(x.time, T.nowStr()) <= 60)) return;
+  const title = tokens(ev.title);
+  const inTitle = w => title.some(x => sameWord(x, w));
+  if (/\b(it|that|them|those|these|both|this one|the one|first one|last one|second one)\b/i.test(msg)) {
+    const recent = load('actions').items.slice(-6).some(x => x.status === 'active' && !x.auto && x.source === 'chat' && T.diffMin(x.time, T.nowStr()) <= 60);
+    if (!RUN.prevUserText && !recent && !contentWords(msg).some(inTitle)) throw new Error('Nothing says which event the user means. Change nothing and ask them.');
+    return;
+  }
+  const words = contentWords(msg);
+  if (!words.length || words.some(inTitle) || contentWords(RUN.prevUserText || '').some(inTitle)) return;
+  if (ev.guests && ev.guests.some(g => words.some(w => g.toLowerCase().includes(w)))) return;
+  if (userGaveClock(msg) === T.clock(ev.start)) return;
+  throw new Error(`Nothing called "${words.join(' ')}" is on the calendar; "${ev.title}" is a different event. Change nothing: say you can't find it (you may ask whether they mean "${ev.title}").`);
 }
 
 function guardEditable(ev, { explicitTarget, needOrganizer }) {
@@ -216,6 +322,10 @@ function namedByUser(ev) {
   if (RUN.source !== 'chat') return false;
   const text = `${RUN.userText || ''} ${RUN.prevUserText || ''}`;
   if (/emergency/i.test(text)) return true;
+  // "my 4pm tomorrow" or a day plus a time names it as well as its title does.
+  if (userGaveClock(RUN.userText) === T.clock(ev.start) && (!datesIn(RUN.userText).length || datesIn(RUN.userText).includes(T.day(ev.start)))) return true;
+  // "move it to 5" right after changing it.
+  if (load('actions').items.slice(-12).some(a => a.status === 'active' && !a.auto && a.source === 'chat' && (a.after || a.before || {}).id === ev.id)) return true;
   const said = tokens(text);
   // Course codes count ("SE", "AI", "OS"), as do typos ("lecutre"); filler words do not.
   const words = tokens(ev.title).filter(w => w.length >= 2 && !['the', 'and', 'with', 'for', 'block', 'session', 'meeting', 'call', 'of', 'to', 'in', 'on', 'at'].includes(w));
@@ -251,8 +361,10 @@ function ambiguity(ev) {
   const mine = wordsOf(ev.title).filter(w => said.has(w));
   if (!mine.length) return '';
   const others = new Map();
+  const named = datesIn(RUN.userText);
   for (const e of cal.list(T.nowStr(), T.addDays(T.today(), 14) + 'T00:00')) {
     if (e.id === ev.id || e.title === ev.title || isAgentBlock(e) || e.kind === 'buffer') continue;
+    if (named.length && !named.includes(T.day(e.start))) continue;
     const w = new Set(wordsOf(e.title));
     if (mine.every(x => w.has(x)) && !others.has(e.title)) others.set(e.title, e);
   }
@@ -283,7 +395,14 @@ export function findDuplicate(title, start, end) {
     const overlap = T.diffMin([start, e.start].sort()[1], [end, e.end].sort()[0]);
     if (overlap < Math.min(len, T.diffMin(e.start, e.end)) * 0.6) continue;
     const a = String(title).toLowerCase().trim(), b = e.title.toLowerCase().trim();
-    if (a === b || titleSimilarity(a, b) >= 0.5 || (a.length > 5 && b.includes(a)) || (b.length > 5 && a.includes(b))) return e;
+    if (a === b || (a.length > 5 && b.includes(a)) || (b.length > 5 && a.includes(b))) return e;
+    // Similar titles are one thing only when neither names something the other lacks:
+    // "Flight to Delhi" vs "Flight AI 101 to Delhi" is a duplicate; "Bring apples" vs "Bring mangoes" is not.
+    const x = titleWords(a), y = titleWords(b);
+    const subset = [...x].every(w => y.has(w)) || [...y].every(w => x.has(w));
+    const sim = titleSimilarity(a, b);
+    const sharedCode = [...x].some(w => /\d/.test(w) && w.length >= 3 && y.has(w)); // a flight / train / booking number
+    if (sim >= 0.75 || (sim >= 0.5 && (subset || sharedCode))) return e;
   }
   return null;
 }
@@ -323,11 +442,12 @@ export function rankStarts(d, dur, starts, { title = '', kind = 'meeting', dayIn
   const ranges = evs.map(e => [T.day(e.start) < d ? 0 : T.mins(e.start), T.day(e.end) > d ? 1440 : (T.mins(e.end) || 1440)]);
   const neighbors = evs.map((e, i) => ({ a: ranges[i][0], b: ranges[i][1], demand: demandOf(e.title, e.kind) }));
   const first = starts.length ? T.hm(starts[0]) : wake;
+  const rhythm = rhythmBias(demand);
   return starts.map(hhmm => {
     const m = T.hm(hhmm);
-    const sc = scoreSlot(m, dur, { demand, wake, sleep, from: first, earlyWeight: 0.1, free: freeAround(m, dur, ranges, s.breakMinutes, 0, 1440), neighbors, brk: s.breakMinutes })
+    const sc = scoreSlot(m, dur, { demand, wake, sleep, from: first, earlyWeight: 0.1, free: freeAround(m, dur, ranges, s.breakMinutes, 0, 1440), neighbors, brk: s.breakMinutes, rhythm })
       - 0.35 * dayIndex - (kind === 'meeting' && m < T.hm(s.workStart) ? 1 : 0);
-    return { date: d, start: hhmm, sc, why: reasonFor(m, dur, demand, wake, sleep) };
+    return { date: d, start: hhmm, sc, why: reasonFor(m, dur, demand, wake, sleep, rhythm) };
   });
 }
 
@@ -347,6 +467,17 @@ function bestTimeOnDay(d, ev, dur, kind, explicit, ignore) {
 }
 
 // ─── People ───
+/** Plans with friends or family: no video link even when someone is invited. */
+const SOCIAL = /\b(dinner|lunch|breakfast|brunch|coffee|drinks?|party|movie|birthday|date|hangout|trip|picnic|game night|family|mom|mum|dad|brother|sister|friends?)\b/i;
+/** Emailing someone else can't be undone, so invites go out only when the user asks (or typed the address). */
+export function mayInvite(text = `${RUN.userText || ''} ${RUN.prevUserText || ''}`) {
+  if (RUN.source !== 'chat' || !RUN.userText) return RUN.source !== 'auto'; // the app's own forms say so explicitly
+  return /\b(invite[sd]?|send (?:an? |the )?(?:invite|invitation)|send it to|share (?:it |this )?with|notify|loop in|add (?:\w+ ){0,2}as (?:a )?guests?|cc)\b/i.test(text) || /[^\s@]+@[^\s@]+\.[a-z]{2,}/i.test(RUN.userText);
+}
+export function personName(email) {
+  const p = load('people').items.find(x => x.email && x.email.toLowerCase() === String(email).toLowerCase());
+  return p ? p.name : String(email);
+}
 export function resolveGuests(text) {
   const people = load('people').items;
   const emails = [], names = [];
@@ -404,96 +535,63 @@ export function planRepeat(start, dur, r) {
 }
 
 // ─── Tools (model-facing) ───
-const STR = (description, extra = {}) => ({ type: 'string', description, ...extra });
-const INT = description => ({ type: 'integer', description });
-const BOOL = description => ({ type: 'boolean', description });
-const ids = { type: 'array', items: { type: 'string' }, description: 'Event ids like E3' };
-const scope = STR('"this" (default) = only this occurrence; "series" = every occurrence of a recurring event', { enum: ['this', 'series'] });
+const STR = (description = '', extra = {}) => ({ type: 'string', ...(description ? { description } : {}), ...extra });
+const INT = (description = '') => ({ type: 'integer', ...(description ? { description } : {}) });
+const BOOL = (description = '') => ({ type: 'boolean', ...(description ? { description } : {}) });
+const STRS = { type: 'array', items: { type: 'string' } };
+const scope = STR('default "this"; "series" = every occurrence', { enum: ['this', 'series'] });
+const obj = (properties, required = []) => ({ type: 'object', properties, ...(required.length ? { required } : {}) });
+const tool = (name, description, parameters = obj({})) => ({ name, description, parameters });
 
 export const TOOL_DECLS = [
-  { name: 'list_events', description: 'List events from start_date to end_date inclusive (max 62 days). Use for days not shown in <context>.',
-    parameters: { type: 'object', properties: { start_date: STR('YYYY-MM-DD'), end_date: STR('YYYY-MM-DD') }, required: ['start_date', 'end_date'] } },
-  { name: 'search_events', description: 'Find events whose title/notes match a text, across a long range (default: last 7 days to 6 months ahead). Use for "all X events", "when is my next X".',
-    parameters: { type: 'object', properties: { query: STR('words from the title'), start_date: STR('YYYY-MM-DD (optional)'), end_date: STR('YYYY-MM-DD (optional)') }, required: ['query'] } },
-  { name: 'find_free_slots', description: 'Free start times for a duration on one day or a range of days. Respects the allowed hours for the kind.',
-    parameters: { type: 'object', properties: {
-      date: STR('YYYY-MM-DD (first day)'), end_date: STR('YYYY-MM-DD (optional last day, max 14 days)'), duration_minutes: INT('length'),
-      earliest: STR('HH:MM (optional)'), latest: STR('HH:MM: slot must END by this (optional)'), kind: STR('meeting|task|focus|personal (default meeting)'),
-      title: STR('what it is for, e.g. "Run" (applies the user\'s time windows for that activity)'),
-    }, required: ['date', 'duration_minutes'] } },
-  { name: 'plan_day', description: 'Builds a whole day in one call: places the listed items around fixed commitments (lectures, labs, meetings), respecting wake/sleep, focus span, breaks and the user\'s activity times; never cancels anything. Use for "plan my day", "maximise productivity", a to-do list for today, "I woke up late", "running late", "reschedule everything from 11".',
-    parameters: { type: 'object', properties: {
-      date: STR('YYYY-MM-DD'), start: STR('"now" or HH:MM: plan from this time (default: now / wake-up time)'), end: STR('HH:MM: plan until (default: wind-down time)'),
-      items: { type: 'array', description: 'What to fit in, in the order the user said it', items: { type: 'object', properties: {
-        title: STR('short title'), minutes: INT('total length'), kind: STR('task|focus|personal', { enum: ['task', 'focus', 'personal'] }),
-        event_id: STR('existing event to re-place, e.g. E5 (instead of creating a new one)'), at: STR('HH:MM only if the user fixed the time'),
-        after: STR('HH:MM earliest start (optional)'), before: STR('HH:MM must end by (optional)'), around: STR('HH:MM when the user said "around"/"-ish"/"roughly" (soft preference)'),
-        priority: STR('high|normal|low', { enum: ['high', 'normal', 'low'] }), split: BOOL('false if the user wants it as one block (default: split into focus-length blocks)'),
-        fill: BOOL('true = may grow to use leftover free time'), notes: STR('description (optional)') }, required: ['title'] } },
-      reflow: BOOL('true = also re-place the movable events already on that day (study blocks, sessions, runs) from start onward, keeping their order; classes, labs, meetings, travel stay fixed'),
-      include_missed: BOOL('with reflow: also re-place movable events earlier that day that were missed (the user woke up late)'),
-      fill_gaps: BOOL('true when the user wants maximum productivity / no empty gaps'), meals: BOOL('with fill_gaps: keep lunch and dinner (default true; false if the user said no lunch/dinner)'),
-      compress: BOOL('true if the user said to shorten breaks/blocks to fit more'), break_minutes: INT('break between blocks (default from settings)'),
-      rationale: STR('one line'),
-    }, required: ['date', 'rationale'] } },
-  { name: 'create_event', description: 'Create an event, optionally repeating. kind: meeting (with people), task (solo work/study), focus (deep work), personal (private life).',
-    parameters: { type: 'object', properties: {
-      title: STR('short title'), start: STR('YYYY-MM-DDTHH:MM (first occurrence), or just YYYY-MM-DD when the user gave no time: the system then picks the best time that day'), end: STR('YYYY-MM-DDTHH:MM (optional)'), duration_minutes: INT('length if no end'),
-      kind: STR('meeting|task|focus|personal', { enum: ['meeting', 'task', 'focus', 'personal'] }),
-      guests: STR('comma-separated names or emails (optional)'), description: STR('notes (optional)'), location: STR('optional'),
-      meet: BOOL('add a Google Meet link (default: yes for meetings with emailed guests)'), reminder_minutes: INT('popup reminder before start (optional)'),
-      repeat: { type: 'object', description: 'Only for repeating events', properties: {
-        every: INT('interval, e.g. 5'), unit: STR('hour|day|week|month', { enum: ['hour', 'day', 'week', 'month'] }),
-        weekdays: { type: 'array', items: { type: 'string' }, description: 'for weekly: MO,TU,WE,TH,FR,SA,SU' },
-        until: STR('YYYY-MM-DD last day (inclusive)'), count: INT('or number of occurrences') } },
-      allow_overlap: BOOL('true ONLY if the user said to book it even if it clashes'),
-      rationale: STR('one short line: why this slot'),
-    }, required: ['title', 'start', 'kind', 'rationale'] } },
-  { name: 'move_event', description: 'Reschedule an event the user organizes. new_start for an exact time, OR new_date alone (system keeps the clock time or the closest free one). Duration kept unless new_end.',
-    parameters: { type: 'object', properties: { event_id: STR('e.g. E3'), new_start: STR('YYYY-MM-DDTHH:MM'), new_date: STR('YYYY-MM-DD'), new_end: STR('YYYY-MM-DDTHH:MM (optional)'), scope,
-      allow_overlap: BOOL('true ONLY if the user said even if it clashes'), rationale: STR('why') }, required: ['event_id', 'rationale'] } },
-  { name: 'create_events', description: 'Create many single events at once (a list the user pasted, a timetable). One call for the whole list.',
-    parameters: { type: 'object', properties: { events: { type: 'array', items: { type: 'object', properties: {
-      title: STR(''), start: STR('YYYY-MM-DDTHH:MM'), end: STR('YYYY-MM-DDTHH:MM (optional)'), duration_minutes: INT('if no end'), kind: STR('meeting|task|focus|personal'),
-      description: STR('optional'), location: STR('optional'), reminder_minutes: INT('optional') }, required: ['title', 'start'] } },
-      allow_overlap: BOOL('true ONLY if the user said to add them even where they clash'), rationale: STR('one line') }, required: ['events', 'rationale'] } },
-  { name: 'update_events', description: 'Change titles / notes / location of many events at once WITHOUT moving them (e.g. "rename these events", "replace the titles in order").',
-    parameters: { type: 'object', properties: { updates: { type: 'array', items: { type: 'object', properties: {
-      event_id: STR('e.g. E12'), title: STR('new title'), description: STR('new notes'), location: STR(''), reminder_minutes: INT('') }, required: ['event_id'] } },
-      rationale: STR('one line') }, required: ['updates', 'rationale'] } },
-  { name: 'rename_in_order', description: 'Rename events in time order per day ("replace the titles in order: 1st, 2nd, 3rd…"). Code matches 1st→first event, never moves anything. Copy every title EXACTLY as written, including [tags].',
-    parameters: { type: 'object', properties: { days: { type: 'array', items: { type: 'object', properties: { date: STR('YYYY-MM-DD'), titles: { type: 'array', items: { type: 'string' }, description: 'new titles, in order' } }, required: ['date', 'titles'] } },
-      match: STR('only events whose current title contains this, e.g. "use claude tokens" (optional)'), rationale: STR('one line') }, required: ['days'] } },
-  { name: 'update_event', description: 'Change details (not time) of ONE event: title, notes, location, guests, Meet link, reminder, flags. Several events → update_events or rename_in_order.',
-    parameters: { type: 'object', properties: { event_id: STR('e.g. E3'), title: STR(''), description: STR(''), location: STR(''), guests: STR('comma-separated; replaces the list'),
-      meet: BOOL('add a Meet link'), reminder_minutes: INT(''), flexible: BOOL(''), high_stakes: BOOL(''), protected: BOOL(''), scope, rationale: STR('why') }, required: ['event_id', 'rationale'] } },
-  { name: 'delete_events', description: 'Cancel events the user organizes, or decline invitations. Several ids at once. scope "series" removes every occurrence of each recurring event.',
-    parameters: { type: 'object', properties: { event_ids: ids, scope, rationale: STR('why') }, required: ['event_ids', 'rationale'] } },
-  { name: 'undo', description: 'Undo changes. action_id for a specific one (ACT-104), otherwise the most recent `count` changes made for the user.',
-    parameters: { type: 'object', properties: { action_id: STR('optional, e.g. ACT-104'), count: INT('default 1'), reason: STR('optional') } } },
-  { name: 'add_task', description: 'Add a to-do that needs calendar time (study, assignment, prep). The planner books work sessions before the due date and re-plans them if displaced.',
-    parameters: { type: 'object', properties: { title: STR(''), minutes: INT('total work time needed'), due: STR('YYYY-MM-DD or YYYY-MM-DDTHH:MM'),
-      priority: STR('high|normal|low', { enum: ['high', 'normal', 'low'] }), session_minutes: INT('max length of one session (default 90)'), notes: STR('') }, required: ['title', 'minutes', 'due'] } },
-  { name: 'update_task', description: 'Change, complete or delete a task by id (T1…).',
-    parameters: { type: 'object', properties: { task_id: STR('e.g. T2'), status: STR('done|open|deleted', { enum: ['done', 'open', 'deleted'] }), title: STR(''), minutes: INT('new total'), due: STR(''), priority: STR('') }, required: ['task_id'] } },
-  { name: 'add_habit', description: 'A recurring block the planner places in the best free time each day inside a window (gym, lunch, revision, reading, focus).',
-    parameters: { type: 'object', properties: { title: STR(''), minutes: INT(''), days: STR('which days: e.g. "MO,TU,WE,TH,FR" or "daily"'),
-      window_start: STR('HH:MM earliest'), window_end: STR('HH:MM latest end'), ideal_time: STR('HH:MM preferred start (optional)'),
-      kind: STR('focus|personal|task', { enum: ['focus', 'personal', 'task'] }) }, required: ['title', 'minutes', 'window_start', 'window_end'] } },
-  { name: 'remove_habit', description: 'Stop a habit (H1…) and remove its future blocks.', parameters: { type: 'object', properties: { habit_id: STR('') }, required: ['habit_id'] } },
-  { name: 'save_rule', description: 'Save a lasting preference the user just stated, as one clear imperative rule. If it limits WHEN an activity happens, also give applies_to + allowed_times so code enforces it.',
-    parameters: { type: 'object', properties: { rule: STR(''), applies_to: STR('activity words, e.g. "run, jog, marathon" (optional)'), allowed_times: STR('e.g. "06:00-08:00, 17:00-21:00" (optional)') }, required: ['rule'] } },
-  { name: 'update_preferences', description: 'Change the user\'s day settings when they state them: wake-up time, wind-down time, how long they can focus, break length, meeting hours.',
-    parameters: { type: 'object', properties: { wake_time: STR('HH:MM'), sleep_time: STR('HH:MM wind-down (latest planned end)'), focus_minutes: INT('longest single focus block'),
-      break_minutes: INT('break between blocks'), work_start: STR('HH:MM meetings from'), work_end: STR('HH:MM meetings until') } } },
-  { name: 'set_goal', description: 'A weekly time goal ("10 hours of CFA a week", "DSA 6h every week"). Time already on the calendar for it counts; only the shortfall gets booked before Sunday.',
-    parameters: { type: 'object', properties: { title: STR('e.g. CFA'), hours_per_week: { type: 'number', description: 'target hours per week' }, counts: STR('words whose events count toward it, e.g. "cfa" (default: the title)') }, required: ['title', 'hours_per_week'] } },
-  { name: 'remove_goal', description: 'Stop a weekly goal (G1… or its title).', parameters: { type: 'object', properties: { goal_id: STR('') }, required: ['goal_id'] } },
-  { name: 'remember_person', description: 'Remember a contact (name → email, notes) so future invites go to the right address.',
-    parameters: { type: 'object', properties: { name: STR(''), email: STR(''), note: STR('') }, required: ['name'] } },
-  { name: 'finish', description: 'Deliver your final report. Call it IN THE SAME TURN as your last action calls. For plain questions just answer in text.',
-    parameters: { type: 'object', properties: { report: STR('1–3 sentences') }, required: ['report'] } },
+  tool('search_events', 'Find events by title words across all dates.', obj({ query: STR(), start_date: STR(), end_date: STR() }, ['query'])),
+  tool('list_events', 'Events on a date range (max 62 days).', obj({ start_date: STR(), end_date: STR() }, ['start_date', 'end_date'])),
+  tool('find_free_slots', 'Free start times on a day or range.', obj({ date: STR(), end_date: STR(), duration_minutes: INT(), earliest: STR('HH:MM'), latest: STR('HH:MM'), kind: STR(), title: STR() }, ['date', 'duration_minutes'])),
+  tool('create_event', 'Create one event, optionally repeating.', obj({
+    title: STR(), start: STR('YYYY-MM-DDTHH:MM or YYYY-MM-DD'), end: STR(), duration_minutes: INT(), kind: STR('', { enum: ['meeting', 'task', 'focus', 'personal'] }),
+    guests: STR('names or emails; invites are sent only if the user asked'), description: STR(), location: STR(), meet: BOOL(), reminder_minutes: INT(), color: STR('priority colour: red (highest), orange, yellow, green, blue, purple, pink, grey (lowest)'),
+    repeat: obj({ every: INT(), unit: STR('', { enum: ['hour', 'day', 'week', 'month'] }), weekdays: { ...STRS, description: 'MO,TU,…' }, until: STR('YYYY-MM-DD'), count: INT() }),
+    allow_overlap: BOOL('only if the user insists') }, ['title', 'start'])),
+  tool('move_event', 'Change when an event happens or how long it is.', obj({ event_id: STR(), new_start: STR('YYYY-MM-DDTHH:MM'), new_date: STR('YYYY-MM-DD'), shift_minutes: INT('+later, -earlier'), duration_minutes: INT('new length'), scope, allow_overlap: BOOL() }, ['event_id'])),
+  tool('update_event', 'Change title, notes, location, guests, colour or reminder of one event.', obj({ event_id: STR(), title: STR(), description: STR(), location: STR(), guests: STR(), meet: BOOL(), reminder_minutes: INT(), color: STR('priority colour: red (highest), orange, yellow, green, blue, purple, pink, grey (lowest)'), scope }, ['event_id'])),
+  tool('delete_events', 'Cancel events: by event_ids, or by query and/or from/to. Invitations get declined.', obj({ event_ids: STRS, scope, query: STR('title words; commas = alternatives'), from: STR('YYYY-MM-DD'), to: STR('YYYY-MM-DD') })),
+  tool('undo', 'Undo the last request\'s changes.', obj({ action_id: STR(), count: INT() })),
+  tool('finish', 'End the turn; the changes are reported automatically.', obj({ note: STR('only what the user must know beyond the changes') })),
+  // Offered only when the message calls for them (see toolsFor in agent.js).
+  tool('create_events', 'Create many events from a list.', obj({ events: { type: 'array', items: obj({ title: STR(), start: STR(), end: STR(), duration_minutes: INT(), kind: STR(), description: STR(), location: STR(), reminder_minutes: INT(), color: STR() }, ['title', 'start']) }, allow_overlap: BOOL() }, ['events'])),
+  tool('update_events', 'Rename or annotate many events without moving them.', obj({ updates: { type: 'array', items: obj({ event_id: STR(), title: STR(), description: STR(), location: STR(), reminder_minutes: INT() }, ['event_id']) } }, ['updates'])),
+  tool('rename_in_order', 'Rename events in time order per day; titles copied exactly.', obj({ days: { type: 'array', items: obj({ date: STR(), titles: STRS }, ['date', 'titles']) }, match: STR('current title contains') }, ['days'])),
+  tool('plan_day', 'Build or re-plan one day around fixed commitments; never cancels.', obj({
+    date: STR(), start: STR('"now" or HH:MM'), end: STR('HH:MM'),
+    items: { type: 'array', items: obj({ title: STR(), minutes: INT(), kind: STR(), event_id: STR('existing event'), at: STR('HH:MM fixed'), after: STR('HH:MM'), before: STR('HH:MM'), around: STR('HH:MM'), priority: STR(), split: BOOL(), fill: BOOL(), notes: STR() }, ['title']) },
+    reflow: BOOL('also re-place movable events on that day'), include_missed: BOOL(), fill_gaps: BOOL(), meals: BOOL(), compress: BOOL(), break_minutes: INT() }, ['date'])),
+  tool('add_task', 'A to-do that gets work sessions booked before its due date.', obj({ title: STR(), minutes: INT(), due: STR(), priority: STR(), session_minutes: INT(), notes: STR() }, ['title', 'minutes', 'due'])),
+  tool('session_status', 'The user did, skipped or half-did a work session that has ended ("I skipped my OS session"). Missed work is re-booked.', obj({ event_id: STR(), task_id: STR(), status: STR('', { enum: ['done', 'missed', 'partial'] }), minutes_done: INT() }, ['status'])),
+  tool('update_task', 'Change, complete or delete a task.', obj({ task_id: STR(), status: STR('', { enum: ['done', 'open', 'deleted'] }), title: STR(), minutes: INT(), due: STR(), priority: STR() }, ['task_id'])),
+  tool('add_habit', 'Recurring block placed in the best free time inside a daily window.', obj({ title: STR(), minutes: INT(), days: STR('"daily" or MO,TU,…'), window_start: STR(), window_end: STR(), ideal_time: STR(), kind: STR() }, ['title', 'minutes', 'window_start', 'window_end'])),
+  tool('remove_habit', 'Stop a habit.', obj({ habit_id: STR() }, ['habit_id'])),
+  tool('set_goal', 'A weekly time goal.', obj({ title: STR(), hours_per_week: { type: 'number' }, counts: STR() }, ['title', 'hours_per_week'])),
+  tool('remove_goal', 'Stop a weekly goal.', obj({ goal_id: STR() }, ['goal_id'])),
+  tool('save_rule', 'Save a lasting preference as one imperative rule.', obj({ rule: STR(), applies_to: STR('activity words'), allowed_times: STR('06:00-08:00, 17:00-21:00') }, ['rule'])),
+  tool('update_preferences', 'Save wake-up, sleep, focus, break or meeting hours.', obj({ wake_time: STR(), sleep_time: STR(), focus_minutes: INT(), break_minutes: INT(), work_start: STR(), work_end: STR() })),
+  tool('remember_person', 'Remember a contact\'s email.', obj({ name: STR(), email: STR(), note: STR() }, ['name'])),
 ];
+const CORE = ['search_events', 'list_events', 'find_free_slots', 'create_event', 'move_event', 'update_event', 'delete_events', 'undo', 'finish'];
+const GROUPS = {
+  plan: { tools: ['plan_day'], re: /\b(plan|replan|re-plan|timetable|time table|optimi[sz]e|productiv\w*|woke|wake|running late|shift my day|reschedule (?:everything|my day)|fill|overwrite|to-?do)\b/i },
+  tasks: { tools: ['add_task', 'update_task', 'session_status'], re: /\b(task|tasks|assignment|due|deadline|finish\w* \w+ by|done with|finished|skipped|missed|didn'?t (?:do|study|finish|get to)|couldn'?t (?:do|study|finish))\b/i },
+  habits: { tools: ['add_habit', 'remove_habit'], re: /\b(habit|sometime between|window)\b/i },
+  goals: { tools: ['set_goal', 'remove_goal'], re: /\b(goal|(?:hours?|hrs?|h) (?:of \w+ )?(?:a|per|each|every) week)\b/i },
+  memory: { tools: ['save_rule', 'update_preferences', 'remember_person'], re: /\b(always|never|from now on|i prefer|i wake|i sleep|wake up at|focus for|email)\b/i },
+  bulk: { tools: ['create_events', 'update_events', 'rename_in_order'], re: /\n|\b(in order|titles|1st|2nd|3rd|following events|these events|rename (?:all|these|them|the))\b/i },
+};
+/** The tool groups a message needs beyond the core CRUD tools. */
+export const groupsFor = text => Object.keys(GROUPS).filter(g => GROUPS[g].re.test(text));
+/** Tool schemas are the largest part of every call, so only the ones this message can use are sent. */
+export function toolsFor(groups = [], only = null) {
+  const names = new Set(only || [...CORE, ...groups.flatMap(g => GROUPS[g].tools)]);
+  return TOOL_DECLS.filter(t => names.has(t.name));
+}
 
 const kindFor = ev => ev.agent && SOFT.includes(ev.kind) ? ev.kind : (isProtected(ev) ? 'personal' : ev.kind);
 const rangeDays = (a, b, max) => {
@@ -586,7 +684,10 @@ export const TOOLS = {
 
   async create_event(a) {
     const s = settings();
-    const kind = ['meeting', 'task', 'focus', 'personal'].includes(a.kind) ? a.kind : 'meeting';
+    if (a.repeat && !a.repeat.unit && (a.repeat.weekdays?.length || a.repeat.until || a.repeat.count || a.repeat.every)) a = { ...a, repeat: { ...a.repeat, unit: a.repeat.weekdays?.length ? 'week' : 'day' } };
+    // "every weekday": named weekdays only make sense weekly, whatever unit the model picked.
+    if (a.repeat && a.repeat.weekdays?.length && /^(day|daily)/.test(String(a.repeat.unit || '')) && !(Number(a.repeat.every) > 1)) a = { ...a, repeat: { ...a.repeat, unit: 'week' } };
+    const kind = ['meeting', 'task', 'focus', 'personal'].includes(a.kind) ? a.kind : (a.guests || /\b(with|call|meet|meeting|sync|interview)\b/i.test(a.title || '') ? 'meeting' : 'task');
     // Only a day given ("gym tomorrow", "CFA 2h on Friday"): the code picks the best time that day, in the same step.
     if (/^\d{4}-\d{2}-\d{2}$/.test(String(a.start || '').trim()) && !(a.repeat && a.repeat.unit) && !(RUN.source === 'chat' && userGaveClock())) {
       const d = String(a.start).trim();
@@ -600,19 +701,28 @@ export const TOOLS = {
     const said = RUN.source === 'chat' && !a._batch ? userGaveClock() : '';
     const start = said && T.clock(T.norm(a.start)) !== said ? T.day(T.norm(a.start)) + 'T' + said : T.norm(a.start);
     const stated = RUN.source === 'chat' && !a._batch ? userGaveDuration() : 0;
-    const dur = a.end ? T.diffMin(start, T.norm(a.end)) : (Number(a.duration_minutes) || stated || (kind === 'meeting' ? 30 : 60));
+    const isReminder = RUN.source === 'chat' && !a._batch && !a.end && !stated && /\bremind\b/i.test(RUN.userText) && !/\b\d+(?:\.\d+)?\s*(?:min|mins|minutes?|h|hrs?|hours?)\b/i.test(RUN.userText);
+    const dur = isReminder ? 15 : a.end ? T.diffMin(start, T.norm(a.end)) : (Number(a.duration_minutes) || stated || (kind === 'meeting' ? 30 : 60));
     if (!(dur > 0) || dur > 24 * 60) throw new Error('Duration must be between 1 minute and 24 hours.');
     const explicit = RUN.source === 'chat' && userGaveTime();
-    const { emails, names } = resolveGuests(a.guests);
-    // "Call with Riya": a known contact named in a meeting's title is invited even if the model forgot.
-    if (kind === 'meeting' && !emails.length) {
+    const { emails: asked, names } = resolveGuests(a.guests);
+    // "Call with Riya": a known contact named in a meeting's title is a guest even if the model forgot.
+    if (kind === 'meeting' && !asked.length) {
       const title = ` ${String(a.title).toLowerCase()} `;
-      for (const p of load('people').items) if (p.email && new RegExp(`[^a-z]${p.name.toLowerCase().split(' ')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^a-z]`).test(title)) emails.push(p.email);
+      for (const p of load('people').items) if (p.email && new RegExp(`[^a-z]${p.name.toLowerCase().split(' ')[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^a-z]`).test(title)) asked.push(p.email);
     }
-    const description = [a.description || '', names.length ? `With: ${names.join(', ')}` : ''].filter(Boolean).join('\n');
-    const meet = a.meet !== undefined ? !!a.meet : (s.meetDefault && kind === 'meeting' && emails.length > 0);
+    // Inviting emails another person and can't be undone, so it happens only when the user asked for it.
+    const consent = mayInvite();
+    const emails = consent ? asked : [];
+    const held = consent ? [] : asked;
+    const withNames = [...names, ...held.map(personName)];
+    const description = [a.description || '', withNames.length ? `With: ${withNames.join(', ')}` : ''].filter(Boolean).join('\n');
+    const meet = emails.length > 0 && (a.meet !== undefined ? !!a.meet : (s.meetDefault && kind === 'meeting' && !SOCIAL.test(a.title || '')));
+    const color = colorId(a.color) || (RUN.source === 'chat' && !a._batch ? userGaveColor() : '');
+    if (a.color && !colorId(a.color)) throw new Error(`"${a.color}" is not a calendar colour. Use red, orange, yellow, green, light green, blue, dark blue, purple, lavender, pink or grey.`);
     const base = { title: exactTitle(a.title).slice(0, 200), kind, agent: true, guests: emails, description, location: a.location || '',
-      meet, reminder: a.reminder_minutes !== undefined ? Number(a.reminder_minutes) : null };
+      meet, reminder: a.reminder_minutes !== undefined ? Number(a.reminder_minutes) : null, color, colorSet: !!color };
+    const inviteNote = held.length ? `Didn't invite ${held.map(personName).join(', ')}: nobody is emailed unless you ask. Say "invite ${personName(held[0])}" to send it.` : undefined;
 
     if (a.repeat && a.repeat.unit) {
       const plan = planRepeat(start, dur, a.repeat);
@@ -653,40 +763,53 @@ export const TOOLS = {
     const end = T.addMin(start, dur);
     const dup = findDuplicate(base.title, start, end);
     if (dup) return { ok: true, duplicate: true, existing: describe(dup), note: `"${dup.title}" is already on the calendar at ${T.span(dup.start, dup.end)}, so nothing new was created. Say so in the report.` };
-    const err = checkPlacement(start, end, { kind, explicit, allowOverlap: !!a.allow_overlap && RUN.source === 'chat', title: base.title });
+    let finalEnd = end;
+    if (RUN.source === 'chat' && !a._batch && !a.end && !a.allow_overlap && !stated && !/\b\d+(?:\.\d+)?\s*(?:min|mins|minutes?|h|hrs?|hours?)\b|\bhalf an? hour\b|\ban hour\b/i.test(RUN.userText)) {
+      const next = clashesWith(start, end, [], { color }).filter(e => e.start > start).map(e => e.start).sort()[0];
+      if (next && !clashesWith(start, next, [], { color }).length && T.diffMin(start, next) >= 30) finalEnd = next;
+    }
+    const err = checkPlacement(start, finalEnd, { kind, explicit, allowOverlap: !!a.allow_overlap && RUN.source === 'chat', title: base.title, color });
     if (err) throw new Error(err);
-    yieldBlocks(start, end, `Made room for "${a.title}"`);
+    yieldBlocks(start, finalEnd, `Made room for "${a.title}"`);
     markWrite();
-    const ev = cal.create({ ...base, start, end });
+    const ev = cal.create({ ...base, start, end: finalEnd });
     const id = logAction('create', null, ev, a.rationale);
-    return { ok: true, action_id: id, event: describe(ev), invited: emails.length ? emails : undefined, not_invited: names.length ? `${names.join(', ')}: no email known, so no invite was sent. Mention that the user can share their email to send invites.` : undefined };
+    // A colour the user gave in this request is a priority call: lower-priority overlaps are cancelled.
+    const pr = color ? applyPriority(ev, { cancel: RUN.source === 'chat' && !!userGaveColor(`${RUN.userText} ${RUN.prevUserText || ''}`) }) : {};
+    const overlaps = overlapNote(start, finalEnd, [ev.id], color);
+    return { ok: true, action_id: id, event: describe(ev), overlaps, priority: pr.note, invited: emails.length ? emails : undefined, not_invited: [names.length ? `${names.join(', ')}: no email known, so no invite was sent. Mention that the user can share their email to send invites.` : '', inviteNote || ''].filter(Boolean).join(' ') || undefined };
   },
 
   async move_event(a) {
     if (RUN.source === 'chat' && userSaidKeepTimes()) throw new Error('The user said to keep the times as they are, so nothing may be moved. Change titles/notes with update_events instead.');
     const ev = mustGet(a.event_id);
+    guardTarget(ev);
     const amb = ambiguity(ev);
     if (amb) throw new Error(amb);
     const explicitTarget = namedByUser(ev);
     guardEditable(ev, { explicitTarget, needOrganizer: true });
     const dur = T.diffMin(ev.start, ev.end);
     const kind = kindFor(ev);
-    const explicit = RUN.source === 'chat' && userGaveTime();
+    const explicit = RUN.source === 'chat' && (userGaveTime() || SWAP.test(RUN.userText) || /\bsame time\b/i.test(RUN.userText));
     const series = a.scope === 'series' && (ev.recurringId || ev.groupId);
     const siblings = series ? cal.series(ev) : [ev];
     const ignore = siblings.map(x => x.id);
+    if (a.shift_minutes) a = { ...a, new_start: T.addMin(ev.start, Number(a.shift_minutes)), new_date: undefined };
+    const resize = Number(a.duration_minutes) > 0 ? Number(a.duration_minutes) : 0;
+    if (!a.new_start && !a.new_date && (resize || a.new_end)) a = { ...a, new_start: ev.start };
     let start;
     // "Move it to Friday" names no time: keep the event's own clock time when that is free, whatever time the model picked.
-    if (a.new_start && !a.new_date && RUN.source === 'chat' && !explicit && !series) {
+    // A swap ("swap the dentist and the passport renewal") takes the other event's time on purpose.
+    if (a.new_start && !a.new_date && !a.shift_minutes && RUN.source === 'chat' && !explicit && !series && !SWAP.test(RUN.userText)) {
       const day = T.day(T.norm(a.new_start)), same = day + 'T' + ev.start.slice(11);
       if (day !== T.day(ev.start) && !clashesWith(same, T.addMin(same, dur), ignore).length && !checkPlacement(same, T.addMin(same, dur), { ignore, kind, explicit: false, title: ev.title })) a = { ...a, new_start: same, new_end: undefined };
     }
     if (a.new_start && !a.new_date) start = T.norm(a.new_start);
     else if (a.new_date || a.new_start) start = bestTimeOnDay(T.day(T.norm(a.new_date || a.new_start)), ev, dur, kind, explicit, ignore);
     else throw new Error('Give new_start (exact time) or new_date (another day).');
-    const end = a.new_end && !a.new_date ? T.norm(a.new_end) : T.addMin(start, dur);
+    const end = resize ? T.addMin(start, resize) : a.new_end && !a.new_date ? T.norm(a.new_end) : T.addMin(start, dur);
     if (start === ev.start && end === ev.end) return { ok: true, note: 'Already at that time; nothing changed.' };
-    const err = checkPlacement(start, end, { ignore, kind, explicit: explicit || (series && explicitTarget), allowOverlap: (!!a.allow_overlap && RUN.source === 'chat') || !!series, title: ev.title });
+    const err = checkPlacement(start, end, { ignore, kind, explicit: explicit || T.clock(start) === T.clock(ev.start) || !!a.shift_minutes || !!resize || (series && explicitTarget), allowOverlap: (!!a.allow_overlap && RUN.source === 'chat') || !!series || (RUN.source === 'chat' && SWAP.test(RUN.userText)), title: ev.title });
     if (err) throw new Error(err);
     if (!series) yieldBlocks(start, end, `Made room for "${ev.title}"`);
     markWrite();
@@ -702,32 +825,48 @@ export const TOOLS = {
       }
     }
     const id = logAction('move', ev, after, a.rationale, { scope: series ? 'series' : 'this', ds, de, ids: series ? ignore : undefined });
-    return { ok: true, action_id: id, event: describe(after), moved: series ? `${siblings.length} loaded occurrences (and the rest of the series)` : undefined };
+    // A coloured event the user moved keeps its priority where it lands.
+    const pr = !series && userColor(after) ? applyPriority(after, { cancel: RUN.source === 'chat' && !RUN.inPlanner }) : {};
+    return { ok: true, action_id: id, event: describe(after), overlaps: series || SWAP.test(RUN.userText) ? undefined : overlapNote(after.start, after.end, [after.id], userColor(after)), priority: pr.note, moved: series ? `${siblings.length} loaded occurrences (and the rest of the series)` : undefined };
   },
 
   async update_event(a) {
     const ev = mustGet(a.event_id);
     if (ev.readOnly) throw new Error(`"${ev.title}" is on another calendar; change it there.`);
+    guardTarget(ev);
     const amb = ambiguity(ev);
     if (amb) throw new Error(amb);
     const patch = {};
     for (const k of ['title', 'description', 'location']) if (a[k] !== undefined) patch[k] = String(a[k]);
-    if (a.guests !== undefined) patch.guests = resolveGuests(a.guests).emails;
+    if (a.guests !== undefined) {
+      const want = resolveGuests(a.guests).emails;
+      const added = want.filter(g => !(ev.guests || []).includes(g));
+      if (added.length && !mayInvite()) throw new Error(`The user did not ask to invite anyone; adding ${added.map(personName).join(', ')} would email them. Change nothing about guests and tell the user they can say "invite ${personName(added[0])}".`);
+      patch.guests = want;
+    }
     if (a.meet !== undefined) patch.meet = !!a.meet;
+    if (a.color !== undefined) {
+      const c = colorId(a.color);
+      if (!c) throw new Error(`"${a.color}" is not a calendar colour. Use red, orange, yellow, green, light green, blue, dark blue, purple, lavender, pink or grey.`);
+      patch.color = c; patch.colorSet = true;
+    }
     if (a.reminder_minutes !== undefined) patch.reminder = Number(a.reminder_minutes);
     if (a.flexible !== undefined) patch.flexible = !!a.flexible;
     if (a.high_stakes !== undefined) patch.highStakes = !!a.high_stakes;
     if (a.protected !== undefined) patch.protected = !!a.protected;
     if (!Object.keys(patch).length) throw new Error('Nothing to update. Pass at least one field.');
-    if (!ev.organizer && Object.keys(patch).some(k => !['flexible', 'highStakes', 'protected', 'reminder'].includes(k))) throw new Error(`The user did not organize "${ev.title}", so only its flags and reminder can change.`);
+    if (!ev.organizer && Object.keys(patch).some(k => !['flexible', 'highStakes', 'protected', 'reminder', 'color'].includes(k))) throw new Error(`The user did not organize "${ev.title}", so only its colour, flags and reminder can change.`);
     markWrite();
     const series = a.scope === 'series' && ev.recurringId && hasV3();
     const after = cal.update(ev.id, patch, { scope: series ? 'series' : 'this' });
     const id = logAction('update', ev, after, a.rationale, { scope: series ? 'series' : 'this' });
-    return { ok: true, action_id: id, event: describe(after) };
+    // A new colour is reported against what it overlaps; nothing is cancelled by recolouring alone.
+    const pr = patch.color && !series ? applyPriority(after, { cancel: false }) : {};
+    return { ok: true, action_id: id, event: describe(after), priority: pr.note, invited: patch.guests && patch.guests.length ? patch.guests : undefined };
   },
 
   async delete_events(a) {
+    if (!(Array.isArray(a.event_ids) ? a.event_ids.length : a.event_ids || a.event_id)) return deleteMatching(a);
     const list = (Array.isArray(a.event_ids) ? a.event_ids : String(a.event_ids || a.event_id || '').split(',')).map(x => String(x).trim()).filter(Boolean);
     if (!list.length) throw new Error('event_ids is empty.');
     const results = [], errors = [];
@@ -740,8 +879,10 @@ export const TOOLS = {
         if (series && doneSeries.has(key)) continue;
         const amb = list.length === 1 && !series ? ambiguity(ev) : '';
         if (amb) throw new Error(amb);
-        guardEditable(ev, { explicitTarget: namedByUser(ev), needOrganizer: false });
+        // A cancel the user asked for is explicit: "protected" only guards against side effects.
+        guardEditable(ev, { explicitTarget: namedByUser(ev) || (RUN.source === 'chat' && cancelRequested()), needOrganizer: false });
         guardCancel(ev);
+        if (list.length === 1) guardTarget(ev);
         markWrite();
         if (series) doneSeries.add(key);
         results.push(removeOne(ev, series, a.rationale));
@@ -753,7 +894,7 @@ export const TOOLS = {
 
   async undo(a) {
     // Only an actual "undo / put it back" may revert things; "no, cancel it" is a new instruction, not an undo.
-    if (RUN.source === 'chat' && RUN.userText && !/\b(undo|revert|put (?:it|them|that) back|restore|bring (?:it|them) back|reverse|go back|wapas|pehle jaisa)\b/i.test(RUN.userText)) {
+    if (RUN.source === 'chat' && RUN.userText && !/\b(undo|revert|put (?:it|them|that|those) back|restore|bring (?:it|them|that|those) back|reverse|go back|changed my mind)\b/i.test(RUN.userText)) {
       throw new Error(`The user did not ask to undo anything ("${RUN.userText.slice(0, 80)}"). Do what they asked instead — read it together with their previous message.`);
     }
     if (a.action_id) return { ok: true, result: revertAction(a.action_id, a.reason || 'Undo requested') };
@@ -786,7 +927,9 @@ export const TOOLS = {
     if (a.break_minutes !== undefined) patch.breakMinutes = Math.max(0, Math.min(60, Number(a.break_minutes) || 0));
     if (!Object.keys(patch).length) throw new Error('Nothing to change. Pass wake_time, sleep_time, focus_minutes, break_minutes, work_start or work_end.');
     const before = settings();
-    if (T.hm(patch.dayStart || before.dayStart) >= T.hm(patch.dayEnd || before.dayEnd)) throw new Error('The wake-up time must be before the wind-down time on the same day (use 23:59 for a late night).');
+    const wake = T.hm(patch.dayStart || before.dayStart), down = T.hm(patch.dayEnd || before.dayEnd);
+    // Sleeping after midnight is fine ("I sleep at 2") as long as the night is a real night.
+    if (wake === down || (down < wake && (down > 6 * 60 || wake - down < 5 * 60))) throw new Error('Wake-up and sleep times must leave at least 5 hours of sleep (sleep after midnight, e.g. 02:00, is fine).');
     saveSettings(patch);
     const names = { dayStart: 'wake_time', dayEnd: 'sleep_time', focusSpan: 'focus_minutes', breakMinutes: 'break_minutes', workStart: 'work_start', workEnd: 'work_end' };
     return { ok: true, saved: Object.fromEntries(Object.entries(patch).map(([k, v]) => [names[k], v])) };
@@ -884,9 +1027,55 @@ function compress(slots, maxRanges) {
 /** Nothing is cancelled unless the user asked for it: to make room, events are moved, never deleted. */
 function guardCancel(ev) {
   if (RUN.source === 'chat' && !RUN.userText) return; // the app's own buttons
-  if (RUN.source === 'chat' && userAskedToCancel()) return;
+  if (RUN.source === 'chat' && cancelRequested()) return;
   if (RUN.source !== 'chat' && isAgentBlock(ev)) return;
+  // Taking back something made earlier in this same request is a correction, not a cancellation.
+  if (load('actions').items.some(a => a.run === RUN.id && a.type === 'create' && a.status === 'active' && a.eventId === ev.id)) return;
   throw new Error(`The user did not ask to cancel anything, so "${ev.title}" stays. To make room, move it (find_free_slots / plan_day) or leave it and say so.`);
+}
+
+/** Cancels what a request describes instead of listing ids: one action, one undo, instances only when a date bounds it. */
+async function deleteMatching(a) {
+  const query = String(a.query || '').trim();
+  if (!query && !a.to) throw new Error('Give event_ids, a query, or a to date.');
+  if (RUN.source !== 'chat' || (RUN.userText && !cancelRequested())) throw new Error('The user did not ask to cancel anything, so nothing was cancelled.');
+  const from = a.from ? T.day(T.norm(a.from)) : T.today();
+  const to = a.to ? T.day(T.norm(a.to)) : T.addDays(T.today(), 183);
+  if (to < from) throw new Error('to is before from.');
+  const alts = query.toLowerCase().split(',').map(q => tokens(q).filter(w => !['the', 'all', 'my', 'of'].includes(w))).filter(x => x.length);
+  // A query must come from the user's words (or the request they follow up on), never from the model's guess.
+  if (RUN.source === 'chat' && alts.length) {
+    const said = tokens(`${RUN.userText || ''} ${RUN.prevUserText || ''}`);
+    const recent = load('actions').items.slice(-8).some(x => x.status === 'active' && !x.auto && x.source === 'chat' && T.diffMin(x.time, T.nowStr()) <= 60);
+    if (!recent && !alts.some(q => q.some(w => said.some(x => sameWord(x, w))))) throw new Error(`The user never named "${query}". Change nothing and ask which event they mean.`);
+  }
+  await ensureRange(from, to);
+  const hit = e => !alts.length || alts.some(q => q.every(w => tokens(e.title).some(x => sameWord(x, w))));
+  const now = T.nowStr();
+  const evs = cal.list(from + 'T00:00', T.addDays(to, 1) + 'T00:00').filter(e => e.end > now && T.day(e.start) >= from && isActive(e) && !e.readOnly && hit(e));
+  const real = evs.filter(e => !(e.agent && e.kind === 'buffer'));
+  if (!real.length) return { ok: true, cancelled: 0, note: `Nothing matches ${query ? '"' + query + '"' : 'that'} from ${from} to ${to}. Say so.` };
+  if (real.length > MAX_BULK_DELETE) throw new Error(`That is ${real.length} events; narrow the dates.`);
+  const done = [];
+  const seriesDone = new Set();
+  const single = [];
+  for (const e of evs) {
+    const key = e.recurringId || e.groupId;
+    if (!a.to && query && key) { if (!seriesDone.has(key)) { seriesDone.add(key); markWrite(); done.push(removeOne(e, true, a.rationale)); } continue; }
+    if (!e.organizer) { markWrite(); done.push(removeOne(e, false, a.rationale)); continue; }
+    single.push(e);
+  }
+  if (single.length) {
+    for (const e of single) { cal.remove(e.id); markCreate(e.id, isAgentBlock(e) ? 'removed_by_user' : 'deleted'); }
+    const shown = single.filter(e => !(e.agent && e.kind === 'buffer'));
+    const counts = new Map();
+    for (const e of shown) counts.set(e.title, (counts.get(e.title) || 0) + 1);
+    const titles = [...counts].slice(0, 8).map(([t, n]) => n > 1 ? `${t} ×${n}` : t).join(', ') + (counts.size > 8 ? ` and ${counts.size - 8} more` : '');
+    logAction('delete', single[0], null, a.rationale, { scope: 'bulk', count: shown.length, titles, snapshots: single });
+    done.push({ cancelled: shown.length });
+  }
+  RUN.planNeeded = true;
+  return { ok: true, done: done.length };
 }
 
 function removeOne(ev, series, rationale) {
@@ -992,10 +1181,10 @@ export function revertAction(actionId, reason) {
     } else cal.update(a.after.id, { start: a.before.start, end: a.before.end });
     what = `Moved "${a.title}" back to ${T.span(a.before.start, a.before.end)}`;
   } else if (a.type === 'delete') {
-    if (x.scope === 'series') {
+    if (x.scope === 'series' || x.scope === 'bulk') {
       const snaps = x.snapshots || [a.before];
       for (const s of snaps) cal.restore(s);
-      what = `Restored ${snaps.length} occurrence(s) of "${a.title}"${googleMode() ? ' as single events' : ''}`;
+      what = x.scope === 'bulk' ? `Restored ${snaps.length} event${snaps.length === 1 ? '' : 's'}` : `Restored ${snaps.length} occurrence(s) of "${a.title}"${googleMode() ? ' as single events' : ''}`;
     } else {
       cal.restore(a.before);
       what = `Restored "${a.title}" at ${T.span(a.before.start, a.before.end)}`;
@@ -1026,6 +1215,11 @@ export function revertAction(actionId, reason) {
 export function noteUserEdit(before, after) {
   if (!before || !isAgentBlock(before)) return;
   const m = load('memory');
+  // What the edit says about the hour (src/rhythm.js): a drag to another time is strong, a delete is weak.
+  if (before.kind !== 'buffer' && before.end > T.nowStr()) {
+    if (!after) noteBlock(false, before, 0.5);
+    else if (T.clock(after.start) !== T.clock(before.start)) { noteBlock(false, before, 0.7); noteBlock(true, after, 0.7); }
+  }
   if (!after) {
     markCreate(before.id, 'removed_by_user');
     m.adjustments.push(`${T.today()}: user deleted agent ${before.kind} "${before.title}" at ${T.span(before.start, before.end)}`);

@@ -1,9 +1,11 @@
 // Platform-neutral API used by both the laptop server (server.js) and Cloudflare (worker.js).
 import * as T from './time.js';
 import * as cal from './calendar.js';
-import { load, save, settings, saveSettings, hydrate, flush, reload, SECRETS } from './store.js';
+import { load, save, settings, saveSettings, hydrate, flush, reload, SECRETS, withWriteLock, discard, snapshot, exportData } from './store.js';
 import { describe, noteUserEdit, beginRun, findAction, TOOLS, isAgentBlock, RUN } from './engine.js';
-import { plan, taskView, findConflicts } from './planner.js';
+import { plan, taskView, findConflicts, sessionsToConfirm, weekLoad } from './planner.js';
+import { parseDayItem } from './dayplan.js';
+import { planText } from './quick.js';
 import { chat, autoRun, chatHistory, appendToLastReply, saveChat } from './agent.js';
 import { applyFeedback, learnProfile } from './learning.js';
 import { importIcs, loadDemo } from './ics.js';
@@ -12,11 +14,14 @@ import { providerStatus, configured } from './llm.js';
 import { briefing, insights, category } from './briefing.js';
 import { radar, morningTime } from './radar.js';
 import { goalsView } from './goals.js';
+import { remindersView, addReminder, updateReminder, syncReminderEvent, listDay } from './reminders.js';
 import { BRIDGE_CODE, BRIDGE_MANIFEST } from './bridge-code.js';
+import { paintOf, colorName, order as colorOrder, COLORS } from './colors.js';
 import { migrate } from './migrate.js';
 import { moveState, startMove, cancelMove, connectMove, recheckOld, exportMove, importMove, switchMove, cleanupMove } from './move.js';
 import { vapid, subscribe, unsubscribe, notify } from './push.js';
 import { checkPassword } from './auth.js';
+import { rhythmView, resetRhythm } from './rhythm.js';
 import { clean } from './agent.js';
 import { bookingEnabled, publicInfo, publicSlots, book, cancelBooking, bookingByToken } from './booking.js';
 
@@ -31,8 +36,8 @@ function exclusive(fn) { const p = chain.then(fn, fn); chain = p.catch(() => {})
  *   stale: a read-only view may use the saved copy however old it is (the app asks /api/sync right after)
  * @returns {Promise<{out: any, problems: string[]}>}
  */
-export function session(fn, { days = [-1, 14], stale = false } = {}) {
-  return exclusive(async () => {
+export function session(fn, { days = [-1, 14], stale = false, read = false } = {}) {
+  return exclusive(() => (read ? run => run() : withWriteLock)(async () => {
     await hydrate();
     migrate();
     T.setTimeZone(settings().timeZone);
@@ -43,11 +48,12 @@ export function session(fn, { days = [-1, 14], stale = false } = {}) {
     try { out = await fn(); } catch (e) { err = e; }
     // Whatever happened, changes already made are sent to Google and saved.
     const problems = google ? await push() : [];
-    await flush();
+    if (read) discard(); else await flush();
     if (err) throw err;
     return { out, problems };
-  });
+  }));
 }
+const READ_ONLY = new Set(['GET /api/state', 'GET /api/home', 'GET /api/chat', 'GET /api/activity', 'GET /api/settings', 'GET /api/memory', 'GET /api/tasks', 'GET /api/reminders', 'GET /api/habits', 'GET /api/radar', 'GET /api/insights', 'GET /api/today', 'GET /api/move', 'GET /api/backup', 'GET /api/health', 'GET /api/public/booking', 'GET /api/public/slots']);
 const NO_CALENDAR = { days: null };
 const VIEW = days => ({ days, stale: true });
 const syncView = () => { const x = syncInfo(); return googleMode() && x ? { at: new Date(x.at).toISOString(), ageSec: Math.round((Date.now() - x.at) / 1000) } : null; };
@@ -77,7 +83,9 @@ function origins() {
   for (const a of load('actions').items) {
     if (!a.eventId || !['create', 'move'].includes(a.type)) continue;
     const id = (a.after && a.after.id) || a.eventId;
-    map.set(id, { origin: a.source === 'auto' ? 'auto' : 'asked', why: a.rationale || '', actionId: a.id, kept: /^good/.test(a.feedback || ''), undone: a.status === 'reverted' });
+    // Work sessions, habit blocks and buffers are placed by the planner even when a chat request set it off.
+    const planned = a.auto || (a.after && (a.after.taskId || a.after.habitId || a.after.kind === 'buffer'));
+    map.set(id, { origin: a.source === 'auto' || planned ? 'auto' : 'asked', why: a.rationale || '', actionId: a.id, kept: /^good/.test(a.feedback || ''), undone: a.status === 'reverted' });
   }
   return map;
 }
@@ -119,7 +127,8 @@ function publicSettings(extra = {}) {
   const s = settings();
   const masked = Object.fromEntries(SECRETS.map(k => [k, s[k] ? '••••' + String(s[k]).slice(-4) : '']));
   return { ...s, ...masked, timeZone: T.tzName(), google: googleMode(), bridgeVersion: googleMode() ? bridgeVersion() : null,
-    ai: providerStatus(), aiReady: configured().length > 0, ...extra };
+    ai: providerStatus(), aiReady: configured().length > 0,
+    colors: colorOrder(s).map(id => ({ id, name: colorName(id), hex: COLORS[id].hex })), ...extra };
 }
 
 function activity() {
@@ -131,7 +140,7 @@ function activity() {
 
 const syncNote = problems => problems.length ? `⚠️ Google Calendar didn't accept ${problems.length} change(s): ${problems.slice(0, 5).join('; ')}` : '';
 const relDays = d => Math.round(T.diffMin(T.today() + 'T00:00', T.day(d) + 'T00:00') / 1440);
-const eventView = e => ({ ...e, view: { ...describe(e), id: e.id }, category: category(e) });
+const eventView = e => { const paint = paintOf(e); return { ...e, view: { ...describe(e), id: e.id }, category: category(e), paint, priority: paint ? colorName(e.color) : '' }; };
 
 /** Background check (cron / timer): plan, briefings, weekly learning. */
 export async function scheduledRun() {
@@ -170,6 +179,16 @@ export async function scheduledRun() {
     }, { days: [0, 2] });
     out[kind] = true;
   }
+  // Once a day: keep the weekly reminder event on the coming Monday (on Tuesday it moves on to next week's).
+  if (load('state').reminderEventDay !== T.today() && load('reminders').items.some(r => !r.done)) {
+    try { await session(async () => { await syncReminderEvent(); load('state').reminderEventDay = T.today(); save('state'); }, { days: [-6, 7] }); }
+    catch (e) { console.error('Reminder event failed:', e.message); }
+  }
+  // A daily copy of everything inside the database, kept 14 days (restore steps: README → Backups).
+  if (load('state').lastBackup !== T.today()) {
+    try { if (await snapshot(T.today(), 14)) await session(() => { load('state').lastBackup = T.today(); save('state'); }, NO_CALENDAR); }
+    catch (e) { console.error('Backup failed:', e.message); }
+  }
   if (T.dow(T.today()) === 0 && load('state').lastLearn !== T.today()) {
     await session(() => { learnProfile(); load('state').lastLearn = T.today(); save('state'); }, { days: [-60, 0] });
   }
@@ -183,6 +202,8 @@ export const isPublicRoute = (method, pathname) => PUBLIC_ROUTES.has(`${method} 
  * @returns {Promise<{status: number, body: any}>}
  */
 export async function handle(method, pathname, query, readBody, ctx = {}) {
+  // Views only read: they skip the writer lock (so they never wait behind a long chat on another device) and save nothing.
+  const S = (fn, opts) => session(fn, { ...opts, read: READ_ONLY.has(`${method} ${pathname}`) });
   const json = async () => { const b = await readBody(); return b ? JSON.parse(b) : {}; };
   const ok = body => ({ status: 200, body });
   const bad = (msg, status = 400) => ({ status, body: { error: msg } });
@@ -196,24 +217,24 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       const from = view === 'day' ? T.day(anchor) : T.weekStart(anchor);
       const n = view === 'day' ? 1 : 7;
       const off = relDays(from);
-      const { out } = await session(() => stateView(from, n, pub), VIEW([Math.min(off, 0), Math.max(off + n, 7)]));
+      const { out } = await S(() => stateView(from, n, pub), VIEW([Math.min(off, 0), Math.max(off + n, 7)]));
       return ok(out);
     }
     case 'GET /api/home': {
       // Everything the Today screen needs in one request (one database read, one calendar load).
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const st = stateView(T.today(), 1, pub);
         const tm = stateView(T.addDays(T.today(), 1), 1, pub);
-        return { st, tm: { events: tm.events }, rd: { ...radar(21), goals: goalsView(), today: T.today() }, decisions: decisions(), autoPlan: autoPlanState(), ledger: ledger() };
+        return { st, tm: { events: tm.events }, rd: { ...radar(21), goals: goalsView(), today: T.today() }, decisions: decisions(), autoPlan: autoPlanState(), ledger: ledger(), checkin: sessionsToConfirm(), week: weekLoad(), reminders: remindersView().open, rhythm: rhythmView() };
       }, VIEW([-6, 22]));
       return ok(out);
     }
     case 'POST /api/autoplan': {
       // Opening the app in the evening (after 18:00, or before 04:00 for a night owl): get the next day ready on its own, once.
       const target = autoPlanTarget();
-      const pre = (await session(() => ({ on: settings().autonomous, done: load('state').autoPlanned === target }), NO_CALENDAR)).out;
-      if (!target || !pre.on || pre.done) return ok({ skipped: !target ? 'not evening' : !pre.on ? 'autonomy off' : 'already planned', target, decisions: (await session(() => decisions(), NO_CALENDAR)).out });
-      const { out, problems } = await session(async () => {
+      const pre = (await S(() => ({ on: settings().autonomous, done: load('state').autoPlanned === target }), NO_CALENDAR)).out;
+      if (!target || !pre.on || pre.done) return ok({ skipped: !target ? 'not evening' : !pre.on ? 'autonomy off' : 'already planned', target, decisions: (await S(() => decisions(), NO_CALENDAR)).out });
+      const { out, problems } = await S(async () => {
         const r = await autoRun({ force: true, label: `Got ${T.day(target) === T.today() ? 'today' : 'tomorrow'} (${T.DAY_NAMES[T.dow(target)]}) ready` });
         const st = load('state');
         st.autoPlanned = target; st.autoPlannedAt = T.nowStr(); save('state');
@@ -223,57 +244,101 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       return ok(out);
     }
     case 'GET /api/today': {
-      const { out } = await session(() => ({ briefing: briefing('morning'), tomorrow: briefing('evening'), now: T.nowStr() }), VIEW([0, 3]));
+      const { out } = await S(() => ({ briefing: briefing('morning'), tomorrow: briefing('evening'), now: T.nowStr() }), VIEW([0, 3]));
       return ok(out);
     }
     case 'POST /api/sync': {
       // Compare the saved copy with Google (one bridge call). The app redraws only if something changed.
-      const { out } = await session(() => refreshSaved(), NO_CALENDAR);
+      const { out } = await S(() => refreshSaved(), NO_CALENDAR);
       return ok({ changed: out.changed, sync: { at: new Date(out.at).toISOString(), ageSec: 0 } });
     }
-    case 'GET /api/chat': return ok((await session(() => chatHistory(), NO_CALENDAR)).out);
+    case 'GET /api/chat': return ok((await S(() => chatHistory(), NO_CALENDAR)).out);
     case 'POST /api/chat': {
       const { message } = await json();
-      const { out, problems } = await session(() => chat(message), { days: [-1, 8] });
+      const { out, problems } = await S(() => chat(message), { days: [-1, 8] });
       if (problems.length) {
-        await session(() => appendToLastReply(syncNote(problems)), NO_CALENDAR);
+        await S(() => appendToLastReply(syncNote(problems)), NO_CALENDAR);
         out.reply += '\n\n' + syncNote(problems);
       }
+      return ok({ reply: out.reply, actions: out.actions, model: out.model });
+    }
+    case 'POST /api/planday': {
+      // The "Plan my day" dialog: lines are read in code and the day planner runs directly (no AI, about 1 s).
+      const a = await json();
+      const lines = (Array.isArray(a.lines) ? a.lines : String(a.lines || '').split('\n')).map(x => String(x).trim()).filter(Boolean).slice(0, 25);
+      const { out, problems } = await S(async () => {
+        const said = `Plan my day for ${a.date}${a.from ? ' from ' + a.from : ''}:\n${lines.map(l => '- ' + l).join('\n')}`;
+        beginRun('chat', said);
+        const items = lines.map(parseDayItem).filter(Boolean);
+        const r = await TOOLS.plan_day({ date: a.date || T.today(), start: a.from || undefined, items, fill_gaps: !!a.fill, meals: a.meals !== false, reflow: !!a.reflow });
+        if (settings().autonomous) await plan();
+        const reply = planText(r);
+        saveChat('user', said, []);
+        saveChat('assistant', reply, RUN.actions.slice());
+        return { reply, actions: RUN.actions.slice() };
+      }, { days: [0, 8] });
+      return ok({ ...out, problems });
+    }
+    case 'POST /api/session': {
+      // Today's check-in: a finished work session was done, or missed (then its time is booked again).
+      const { eventId, status } = await json();
+      const { out } = await S(async () => { beginRun('chat'); const r = await TOOLS.session_status({ event_id: eventId, status }); return { ...r, actions: RUN.actions.slice() }; }, { days: [-2, 15] });
       return ok(out);
     }
     case 'POST /api/chat/clear': {
-      await session(() => { load('chat').messages = []; save('chat'); }, NO_CALENDAR);
+      await S(() => { load('chat').messages = []; save('chat'); }, NO_CALENDAR);
       return ok({ ok: true });
     }
-    case 'GET /api/activity': return ok((await session(() => activity(), NO_CALENDAR)).out);
+    case 'GET /api/backup': {
+      // Everything Donna knows, as one JSON file (no keys or tokens). Restore = Settings → Data → import is not offered:
+      // this is for keeping a copy off Cloudflare; the daily in-database copies are the restore path.
+      const { out } = await S(async () => ({ app: 'donna', exported: new Date().toISOString(), data: await exportData() }), NO_CALENDAR);
+      return ok(out);
+    }
+    case 'GET /api/health': {
+      const { out } = await S(() => {
+        const st = load('state');
+        const days = Object.entries(st.metrics || {}).sort().slice(-14).reverse().map(([day, r]) => ({ day, ...r, avgMs: Math.round(r.ms / Math.max(1, r.code + r.ai + r.failed)) }));
+        const since = T.addDays(T.today(), -7) + 'T00:00';
+        const mine = load('actions').items.filter(a => a.time >= since && a.type !== 'revert' && a.status !== 'yielded');
+        const chatChanges = mine.filter(a => a.source === 'chat' && !a.auto), autoChanges = mine.filter(a => a.auto || a.source === 'auto');
+        return { days, undo: { chat: chatChanges.length, chatUndone: chatChanges.filter(a => a.status === 'reverted').length, auto: autoChanges.length, autoUndone: autoChanges.filter(a => a.status === 'reverted').length },
+          lastBackup: st.lastBackup || null, lastAutoRun: st.lastAutoRun || null };
+      }, NO_CALENDAR);
+      return ok(out);
+    }
+    case 'GET /api/activity': return ok((await S(() => activity(), NO_CALENDAR)).out);
     case 'POST /api/feedback': {
       const { id, verdict, reason } = await json();
-      const { out, problems } = await session(async () => {
+      const { out, problems } = await S(async () => {
         beginRun('chat');
         const a = findAction(id);
         const snap = a && (a.before || a.after);
         if (snap && snap.start) await ensureRange(T.day(snap.start) < T.today() ? T.day(snap.start) : T.today(), T.day((a.after || a.before).start));
         const text = await applyFeedback(String(id).toUpperCase(), String(verdict).toLowerCase(), reason || '');
         if (RUN.planNeeded && settings().autonomous) await plan();
-        saveChat('user', `${id}: ${verdict}${reason ? ' - ' + reason : ''}`, []);
-        saveChat('assistant', text, RUN.actions.slice());
+        // A plain Undo button press shows on the change card itself; it doesn't need two chat lines.
+        if (String(verdict).toLowerCase() !== 'undo') {
+          saveChat('user', `${id}: ${verdict}${reason ? ' - ' + reason : ''}`, []);
+          saveChat('assistant', text, RUN.actions.slice());
+        }
         return text;
       }, { days: [0, 7] });
       return ok({ text: out + (problems.length ? '\n' + syncNote(problems) : '') });
     }
-    case 'GET /api/settings': return ok((await session(() => pub(), NO_CALENDAR)).out);
+    case 'GET /api/settings': return ok((await S(() => pub(), NO_CALENDAR)).out);
     case 'POST /api/settings': {
       const patch = await json();
-      const { out } = await session(() => { saveSettings(patch); T.setTimeZone(settings().timeZone); invalidateCache(); return pub(); }, NO_CALENDAR);
+      const { out } = await S(() => { saveSettings(patch); T.setTimeZone(settings().timeZone); invalidateCache(); return pub(); }, NO_CALENDAR);
       return ok(out);
     }
     case 'POST /api/ai/reset': {
-      await session(() => { load('state').aiBlocked = {}; save('state'); }, NO_CALENDAR);
+      await S(() => { load('state').aiBlocked = {}; save('state'); }, NO_CALENDAR);
       return ok({ ok: true });
     }
     case 'POST /api/bridge/test': {
       const patch = await json();
-      const { out } = await session(async () => {
+      const { out } = await S(async () => {
         if (patch && Object.keys(patch).length) saveSettings(patch);
         const started = Date.now();
         const r = await ping();
@@ -285,7 +350,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       return ok(out);
     }
     case 'GET /api/bridge/code': {
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const token = settings().bridgeToken;
         if (!token) throw new Error('Set a bridge token first (any long random text), save, then copy the code.');
         return { code: BRIDGE_CODE.replace('__TOKEN__', token.replace(/[^A-Za-z0-9_-]/g, '')), manifest: BRIDGE_MANIFEST };
@@ -294,7 +359,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     }
     case 'POST /api/briefing/send': {
       const { kind } = await json();
-      const { out } = await session(async () => {
+      const { out } = await S(async () => {
         const b = briefing(kind === 'evening' ? 'evening' : 'morning');
         const r = await emailMe(b.title, b.html);
         return { ...r, preview: b.text };
@@ -304,12 +369,13 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     case 'GET /api/insights': {
       const week = T.weekStart(query.get('week') || T.today());
       const off = relDays(week);
-      return ok((await session(() => insights(week), VIEW([Math.min(off, 0), off + 7]))).out);
+      return ok((await S(() => insights(week), VIEW([Math.min(off, 0), off + 7]))).out);
     }
-    case 'GET /api/memory': return ok((await session(() => ({ ...load('memory'), people: load('people').items }), NO_CALENDAR)).out);
+    case 'GET /api/memory': return ok((await S(() => ({ ...load('memory'), people: load('people').items, rhythm: rhythmView() }), NO_CALENDAR)).out);
+    case 'POST /api/rhythm/reset': return ok((await S(() => { resetRhythm(); return { rhythm: rhythmView() }; }, NO_CALENDAR)).out);
     case 'POST /api/rules': {
       const { id, text, active, remove } = await json();
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const m = load('memory');
         if (id) {
           const r = m.rules.find(x => x.id === id);
@@ -326,7 +392,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     }
     case 'POST /api/people': {
       const { id, name, email, note, remove } = await json();
-      const { out } = await session(async () => {
+      const { out } = await S(async () => {
         const p = load('people');
         if (remove) { p.items = p.items.filter(x => x.id !== id); save('people'); }
         else await TOOLS.remember_person({ name, email, note });
@@ -334,41 +400,54 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       }, NO_CALENDAR);
       return ok(out);
     }
-    case 'POST /api/relearn': return ok((await session(() => { learnProfile(); return { ...load('memory'), people: load('people').items }; }, { days: [-60, 0] })).out);
+    case 'POST /api/relearn': return ok((await S(() => { learnProfile(); return { ...load('memory'), people: load('people').items }; }, { days: [-60, 0] })).out);
     case 'POST /api/run': {
-      const { out, problems } = await session(() => autoRun({ force: true }), { days: [0, Math.max(settings().planDaysAhead + 1, 8)] });
+      const { out, problems } = await S(() => autoRun({ force: true }), { days: [0, Math.max(settings().planDaysAhead + 1, 8)] });
       if (out && problems.length) out.text = (out.text || '') + '\n' + syncNote(problems);
       return ok(out);
     }
 
     // ─── Tasks & habits (UI) ───
-    case 'GET /api/tasks': return ok((await session(() => load('tasks').items.map(taskView), NO_CALENDAR)).out);
+    case 'GET /api/tasks': return ok((await S(() => load('tasks').items.map(taskView), NO_CALENDAR)).out);
     case 'POST /api/tasks': {
       const a = await json();
-      const { out, problems } = await session(async () => {
+      const { out, problems } = await S(async () => {
         beginRun('chat', '');
         const r = a.id ? await TOOLS.update_task({ task_id: a.id, ...a }) : await TOOLS.add_task(a);
         return { ...r, tasks: load('tasks').items.map(taskView) };
       }, { days: [0, 15] });
       return ok({ ...out, problems });
     }
+    case 'GET /api/reminders': return ok((await S(() => ({ ...remindersView(), reminderEvent: settings().reminderEvent !== false, listDay: listDay() }), NO_CALENDAR)).out);
+    case 'POST /api/reminders': {
+      // { text } adds; { id, done | pinned | text | remove } changes one. Reminders never touch the calendar.
+      const a = await json();
+      // { reminderEvent } turns the weekly Monday event on or off. Reads this week's Monday through next Monday.
+      const { out, problems } = await S(async () => {
+        if (a.reminderEvent !== undefined) saveSettings({ reminderEvent: a.reminderEvent });
+        const r = a.id ? { reminder: updateReminder(String(a.id), a) } : a.text !== undefined ? addReminder(a.text) : {};
+        await syncReminderEvent();
+        return { ...r, ...remindersView(), reminderEvent: settings().reminderEvent !== false, listDay: listDay() };
+      }, { days: [-6, 7] });
+      return ok({ ...out, problems });
+    }
     case 'GET /api/radar': {
-      const { out } = await session(() => ({ ...radar(21), goals: goalsView(), today: T.today() }), VIEW([-6, 22]));
+      const { out } = await S(() => ({ ...radar(21), goals: goalsView(), today: T.today() }), VIEW([-6, 22]));
       return ok(out);
     }
     case 'POST /api/goals': {
       const a = await json();
-      const { out, problems } = await session(async () => {
+      const { out, problems } = await S(async () => {
         beginRun('chat', '');
         const r = a.remove ? await TOOLS.remove_goal({ goal_id: a.id }) : await TOOLS.set_goal({ title: a.title, hours_per_week: a.hours, counts: a.counts });
         return { ...r, goals: goalsView() };
       }, { days: [-6, 8] });
       return ok({ ...out, problems });
     }
-    case 'GET /api/habits': return ok((await session(() => load('habits').items, NO_CALENDAR)).out);
+    case 'GET /api/habits': return ok((await S(() => load('habits').items, NO_CALENDAR)).out);
     case 'POST /api/habits': {
       const a = await json();
-      const { out, problems } = await session(async () => {
+      const { out, problems } = await S(async () => {
         beginRun('chat', '');
         let r;
         if (a.remove) r = await TOOLS.remove_habit({ habit_id: a.id });
@@ -392,7 +471,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       const e = await json();
       if (!(e.end > e.start)) return bad('End must be after start.');
       const d = relDays(e.start);
-      const { out, problems } = await session(() => cal.create({ title: e.title || 'Untitled', start: e.start, end: e.end, kind: e.kind || 'meeting',
+      const { out, problems } = await S(() => cal.create({ title: e.title || 'Untitled', start: e.start, end: e.end, kind: e.kind || 'meeting',
         guests: e.guests || [], description: e.description || '', location: e.location || '', meet: !!e.meet,
         flexible: !!e.flexible, highStakes: !!e.highStakes, protected: !!e.protected, organizer: e.organizer !== false }), { days: [d, d] });
       return ok({ event: out, problems });
@@ -401,7 +480,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       const { id, origStart, scope, ...patch } = await json();
       const d = relDays(origStart || patch.start);
       const d2 = relDays(patch.start || origStart);
-      const { out, problems } = await session(() => {
+      const { out, problems } = await S(() => {
         const before = cal.get(id);
         if (!before) return null;
         if (before.readOnly) throw new Error(`"${before.title}" is on another calendar; change it there.`);
@@ -416,7 +495,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     case 'POST /api/events/delete': {
       const { id, origStart, scope } = await json();
       const d = origStart ? relDays(origStart) : 0;
-      const { problems } = await session(() => {
+      const { problems } = await S(() => {
         const before = cal.get(id);
         if (!before) return;
         if (before.readOnly) throw new Error(`"${before.title}" is on another calendar; change it there.`);
@@ -428,7 +507,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     case 'POST /api/import': {
       const replace = query.get('replace') === '1';
       const text = await readBody();
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         if (googleMode()) throw new Error('You are connected to Google Calendar, so import is not needed: the agent reads Google directly.');
         const n = importIcs(text, { replace });
         learnProfile();
@@ -437,7 +516,7 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       return ok(out);
     }
     case 'POST /api/demo': {
-      const { out } = await session(async () => {
+      const { out } = await S(async () => {
         if (googleMode()) throw new Error('Switch the calendar to "Practice calendar" in Settings to load the demo.');
         const n = loadDemo();
         learnProfile();
@@ -449,37 +528,37 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     }
 
     // ─── Move to another Google account ───
-    case 'GET /api/move': return ok((await session(() => moveState(), NO_CALENDAR)).out);
-    case 'POST /api/move/start': return ok((await session(() => startMove(), NO_CALENDAR)).out);
-    case 'POST /api/move/cancel': return ok((await session(() => cancelMove(), NO_CALENDAR)).out);
+    case 'GET /api/move': return ok((await S(() => moveState(), NO_CALENDAR)).out);
+    case 'POST /api/move/start': return ok((await S(() => startMove(), NO_CALENDAR)).out);
+    case 'POST /api/move/cancel': return ok((await S(() => cancelMove(), NO_CALENDAR)).out);
     case 'GET /api/move/code': {
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const m = load('state').move || {};
         if (!m.token) throw new Error('Start the move first.');
         return { code: BRIDGE_CODE.replace('__TOKEN__', m.token), manifest: BRIDGE_MANIFEST };
       }, NO_CALENDAR);
       return ok(out);
     }
-    case 'POST /api/move/connect': { const { url } = await json(); return ok((await session(() => connectMove(url), NO_CALENDAR)).out); }
-    case 'POST /api/move/recheck': return ok((await session(() => recheckOld(), NO_CALENDAR)).out);
-    case 'POST /api/move/export': return ok((await session(() => exportMove(), NO_CALENDAR)).out);
-    case 'POST /api/move/import': return ok((await session(() => importMove(), NO_CALENDAR)).out);
-    case 'POST /api/move/switch': return ok((await session(() => switchMove(), NO_CALENDAR)).out);
-    case 'POST /api/move/cleanup': return ok((await session(() => cleanupMove(), NO_CALENDAR)).out);
+    case 'POST /api/move/connect': { const { url } = await json(); return ok((await S(() => connectMove(url), NO_CALENDAR)).out); }
+    case 'POST /api/move/recheck': return ok((await S(() => recheckOld(), NO_CALENDAR)).out);
+    case 'POST /api/move/export': return ok((await S(() => exportMove(), NO_CALENDAR)).out);
+    case 'POST /api/move/import': return ok((await S(() => importMove(), NO_CALENDAR)).out);
+    case 'POST /api/move/switch': return ok((await S(() => switchMove(), NO_CALENDAR)).out);
+    case 'POST /api/move/cleanup': return ok((await S(() => cleanupMove(), NO_CALENDAR)).out);
 
     // ─── Notifications & Siri ───
-    case 'GET /api/push/key': return ok((await session(async () => ({ publicKey: (await vapid()).publicKey, devices: (load('push').subscriptions || []).map(s => s.device) }), NO_CALENDAR)).out);
+    case 'GET /api/push/key': return ok((await S(async () => ({ publicKey: (await vapid()).publicKey, devices: (load('push').subscriptions || []).map(s => s.device) }), NO_CALENDAR)).out);
     case 'POST /api/push/subscribe': {
       const { subscription, device } = await json();
-      return ok((await session(() => ({ devices: subscribe(subscription, device) }), NO_CALENDAR)).out);
+      return ok((await S(() => ({ devices: subscribe(subscription, device) }), NO_CALENDAR)).out);
     }
-    case 'POST /api/push/unsubscribe': { const { endpoint } = await json(); await session(() => unsubscribe(endpoint), NO_CALENDAR); return ok({ ok: true }); }
+    case 'POST /api/push/unsubscribe': { const { endpoint } = await json(); await S(() => unsubscribe(endpoint), NO_CALENDAR); return ok({ ok: true }); }
     case 'POST /api/push/test': {
-      const { out } = await session(() => notify({ title: settings().agentName, body: 'Notifications are working. Briefings and changes will show up here.', url: '/#today', tag: 'test' }), NO_CALENDAR);
+      const { out } = await S(() => notify({ title: settings().agentName, body: 'Notifications are working. Briefings and changes will show up here.', url: '/#today', tag: 'test' }), NO_CALENDAR);
       return ok({ sent: out });
     }
     case 'POST /api/siri/key': {
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const key = Array.from(crypto.getRandomValues(new Uint8Array(24)), b => b.toString(16).padStart(2, '0')).join('');
         saveSettings({ siriKey: key });
         return { key };
@@ -494,13 +573,13 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
       if (raw) { try { message = JSON.parse(raw).message || message; } catch { message = raw; } }
       const plain = query.get('format') !== 'json';
       // Check the key before touching Google: a wrong key must not cost a calendar read.
-      const refused = (await session(() => {
+      const refused = (await S(() => {
         const s = settings();
         if (!s.siriKey || !checkPassword(key, s.siriKey)) return { status: 401, reply: "That Siri key is wrong. Copy the link again from the app's settings." };
         if (!String(message).trim()) return { status: 400, reply: "I didn't catch that. Try again?" };
         return null;
       }, NO_CALENDAR)).out;
-      const { out } = refused ? { out: refused } : await session(async () => {
+      const { out } = refused ? { out: refused } : await S(async () => {
         const r = await chat(String(message));
         return { status: 200, reply: r.reply, actions: r.actions.filter(a => !a.auto).map(a => a.summary) };
       }, { days: [-1, 8] });
@@ -511,15 +590,15 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     // ─── Public booking page (no login) ───
     case 'GET /api/public/booking': {
       const slug = query.get('slug') || '';
-      const { out } = await session(() => bookingEnabled(slug) ? publicInfo() : null, NO_CALENDAR);
+      const { out } = await S(() => bookingEnabled(slug) ? publicInfo() : null, NO_CALENDAR);
       return out ? ok(out) : bad('This booking page does not exist.', 404);
     }
     case 'GET /api/public/slots': {
       const slug = query.get('slug') || '';
       // Settings come from the database, so check them in a session before reading the calendar.
-      const ahead = (await session(() => bookingEnabled(slug) ? settings().booking.daysAhead : null, NO_CALENDAR)).out;
+      const ahead = (await S(() => bookingEnabled(slug) ? settings().booking.daysAhead : null, NO_CALENDAR)).out;
       if (ahead === null) return bad('This booking page does not exist.', 404);
-      const { out } = await session(async () => {
+      const { out } = await S(async () => {
         await ensureRange(T.today(), T.addDays(T.today(), settings().booking.daysAhead + 1));
         return publicSlots(query.get('duration'));
       }, { days: [0, Math.min(60, ahead + 1)] });
@@ -527,32 +606,32 @@ export async function handle(method, pathname, query, readBody, ctx = {}) {
     }
     case 'POST /api/public/book': {
       const a = await json();
-      const ahead = (await session(() => bookingEnabled(a.slug) ? settings().booking.daysAhead : null, NO_CALENDAR)).out;
+      const ahead = (await S(() => bookingEnabled(a.slug) ? settings().booking.daysAhead : null, NO_CALENDAR)).out;
       if (ahead === null) return bad('This booking page does not exist.', 404);
-      const { out, problems } = await session(async () => {
+      const { out, problems } = await S(async () => {
         await ensureRange(T.today(), T.addDays(T.today(), settings().booking.daysAhead + 1));
         const r = book(a);
         if (settings().autonomous) await plan();
-        saveChat('assistant', `📅 New booking: ${a.name} booked ${T.span(r.start, r.end)} through your booking page.`, r.actions);
+        saveChat('assistant', `New booking: ${a.name} booked ${T.span(r.start, r.end)} through your booking page.`, r.actions);
         if (settings().notify.bookings) await notify({ title: 'New booking', body: `${a.name} booked ${T.span(r.start, r.end)}`, url: '/#calendar', tag: 'booking' });
         return r;
       }, { days: [0, Math.min(60, ahead + 1)] });
       if (problems.length) return bad('Booking failed on the calendar side. Please try another time.', 502);
-      const link = (await session(() => bookingByToken(out.token), { days: [relDays(out.start), relDays(out.start)] })).out;
+      const link = (await S(() => bookingByToken(out.token), { days: [relDays(out.start), relDays(out.start)] })).out;
       return ok({ ok: true, start: out.start, end: out.end, title: out.title, token: out.token, meetLink: link && link.meetLink || '' });
     }
     case 'GET /api/public/cancel': {
       const t = query.get('token');
-      const { out } = await session(() => bookingByToken(t), NO_CALENDAR);
+      const { out } = await S(() => bookingByToken(t), NO_CALENDAR);
       return out ? ok(out) : bad('Booking not found.', 404);
     }
     case 'POST /api/public/cancel': {
       const { token } = await json();
-      const b = (await session(() => bookingByToken(token), NO_CALENDAR)).out;
+      const b = (await S(() => bookingByToken(token), NO_CALENDAR)).out;
       if (!b) return bad('Booking not found.', 404);
-      const { out } = await session(() => {
+      const { out } = await S(() => {
         const r = cancelBooking(token);
-        saveChat('assistant', `📅 ${b.name} cancelled their booking on ${T.span(b.start, b.end)}.`, RUN.actions.slice());
+        saveChat('assistant', `${b.name} cancelled their booking on ${T.span(b.start, b.end)}.`, RUN.actions.slice());
         return r;
       }, { days: [relDays(b.start), relDays(b.start)] });
       return ok(out);

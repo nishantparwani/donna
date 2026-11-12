@@ -8,6 +8,7 @@ import { load, save, settings } from './store.js';
 import { TOOLS, RUN, realId, isAgentBlock, isTimed, isPing, activityWindows, windowFor, logAction, markWrite, markCreate } from './engine.js';
 import { ensureRange } from './sync.js';
 import { demandOf, energy, scoreSlot, freeAround } from './smart.js';
+import { rhythmBias } from './rhythm.js';
 
 const STEP = 5;
 const MIN_BLOCK = 30;
@@ -87,12 +88,13 @@ function place({ items, obstacles, S, E, brk, focus, compress, fill, fillers, me
   const best = (ws, len, it, from) => {
     const same = placed.filter(p => p.it === it);
     const neighbors = [...obstacles.map(o => ({ a: o.a, b: o.b, demand: o.demand })), ...placed.map(p => ({ a: p.a, b: p.b, demand: p.it.demand }))];
+    const rhythm = it.meal ? null : rhythmBias(it.demand);
     let top = null;
     for (const [lo, hi] of ws) {
       for (let t = round(Math.max(lo, from)); t + len <= hi; t += STEP) {
         if (!fits(t, len)) continue;
         const sc = scoreSlot(t, len, { demand: it.demand, wake, sleep, from: S, earlyWeight: today ? 0.08 : 0.04, ideal: it.ideal ?? null, idealWeight: it.meal ? 0.4 : 1.4,
-          free: freeAround(t, len, busy, brk, S, E), neighbors, same, brk });
+          free: freeAround(t, len, busy, brk, S, E), neighbors, same, brk, rhythm });
         if (!top || sc > top.sc + 1e-9) top = { t, sc };
       }
     }
@@ -141,12 +143,14 @@ function place({ items, obstacles, S, E, brk, focus, compress, fill, fillers, me
   // 3. Meals, items with their own time limits (narrowest first), then the rest — in the variant's order.
   const fresh = items.filter(x => !x.reflow && x.at == null);
   const mealItems = meals.map((m, i) => ({ title: m.title, minutes: 30, kind: 'personal', after: m.from, before: m.to, ideal: m.from + 45, meal: true, demand: 'meal', order: -10 + i, split: false }));
-  const constrained = it => it.after != null || it.before != null || !!activityWindows(it.title, s);
+  // A time the user hinted at ("run around 7pm") is a constraint too: it goes before the flexible work that could take that time.
+  const constrained = it => it.after != null || it.before != null || it.ideal != null || !!activityWindows(it.title, s);
+  const room = it => it.ideal != null ? 120 : windows(it).reduce((n, [a, b]) => n + b - a, 0);
   // What matters most first; deep work before light (it needs the peak hours) unless the variant keeps the user's order.
   const weight = { deep: 0, physical: 1, social: 1, neutral: 2, light: 3, meal: 4 };
   const rest = fresh.filter(x => !constrained(x)).sort((x, y) => (x.rank - y.rank) || (variant.deepFirst ? weight[x.demand] - weight[y.demand] : 0)
     || (variant.longFirst ? y.minutes - x.minutes : 0) || (x.order - y.order));
-  const narrow = fresh.filter(constrained).sort((x, y) => windows(x).reduce((n, [a, b]) => n + b - a, 0) - windows(y).reduce((n, [a, b]) => n + b - a, 0));
+  const narrow = fresh.filter(constrained).sort((x, y) => room(x) - room(y));
   const ordered = variant.mealsFirst === false ? [...narrow, ...rest, ...mealItems] : [...mealItems, ...narrow, ...rest];
   let mealsMissed = 0;
   for (const it of ordered) {
@@ -407,3 +411,36 @@ Object.assign(TOOLS, {
     };
   },
 });
+
+// ─── "Plan my day" without the AI: the dialog's lines are read in code ───
+// "CFA study 2h", "Side project 3 hours", "5k run around 7pm", "College assignments 1.5h before 6pm",
+// "Weekly review in the evening", "Lunch with Sam at 1pm". Instant, exact, and it works when every AI quota is used.
+function clockOf(h, m, ap) {
+  let x = Number(h) % 24;
+  if (/pm/i.test(ap || '') && x < 12) x += 12;
+  if (/am/i.test(ap || '') && x === 12) x = 0;
+  if (!ap && x >= 1 && x <= 7) x += 12; // "around 7" during a day plan means the evening
+  return T.toHM(x * 60 + Number(m || 0));
+}
+export function parseDayItem(line) {
+  let t = ' ' + String(line || '').replace(/^\s*(?:[-•*]|\d+[.)])\s*/, '').trim() + ' ';
+  const item = {};
+  const take = (re, fn) => { const m = re.exec(t); if (m) { fn(m); t = t.slice(0, m.index) + ' ' + t.slice(m.index + m[0].length); } };
+  take(/\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(h|hrs?|hours?)(?:\s*(?:and\s*)?(\d+)\s*(?:m|mins?|minutes?))?\b/i, m => { item.minutes = Math.round(Number(m[1]) * 60 + Number(m[3] || 0)); });
+  if (!item.minutes) take(/\b(?:for\s+)?(\d+)\s*(m|mins?|minutes?)\b/i, m => { item.minutes = Number(m[1]); });
+  if (!item.minutes) take(/\b(?:for\s+)?(half an hour|an hour|one hour|two hours|three hours)\b/i, m => { item.minutes = { 'half an hour': 30, 'an hour': 60, 'one hour': 60, 'two hours': 120, 'three hours': 180 }[m[1].toLowerCase()]; });
+  take(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?![\d:])/i, m => { item.at = clockOf(m[1], m[2], m[3]); });
+  take(/(?:\b(?:around|about)\s*|~\s*)(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?![\d:])/i, m => { item.around = clockOf(m[1], m[2], m[3]); });
+  take(/\bafter\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?![\d:])/i, m => { item.after = clockOf(m[1], m[2], m[3]); });
+  take(/\b(?:before|by)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?![\d:])/i, m => { item.before = clockOf(m[1], m[2], m[3]); });
+  take(/\b(?:before|by)\s+noon\b/i, () => { item.before = '12:00'; });
+  take(/\b(?:in the |this )?(morning)\b/i, () => { item.before = item.before || '12:00'; });
+  take(/\b(?:in the |this )?(afternoon)\b/i, () => { item.after = item.after || '12:00'; item.before = item.before || '17:00'; });
+  take(/\b(?:in the |this )?(evening|tonight)\b/i, () => { item.after = item.after || '17:00'; });
+  take(/\b(?:at )?night\b/i, () => { item.after = item.after || '20:00'; });
+  take(/\b(high priority|important|urgent|must)\b/i, () => { item.priority = 'high'; });
+  item.title = t.replace(/\s+/g, ' ').replace(/^[\s,:-]+|[\s,:-]+$/g, '').replace(/\s+(?:for|at|in|the|of)$/i, '').trim();
+  if (!item.title) return null;
+  item.title = item.title[0].toUpperCase() + item.title.slice(1);
+  return item;
+}

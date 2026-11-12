@@ -55,7 +55,7 @@ for (const sc of chosen) {
   setTimeZone('Asia/Kolkata');
   setAiBinding(PROVIDER === 'workers-ai' ? probe : null);
   const model = process.env.EVAL_MODEL;
-  saveSettings({ ...keys, aiOrder: [PROVIDER], autonomous: true, dayStart: '07:00', dayEnd: '23:00',
+  saveSettings({ ...keys, privateAi: false, aiOrder: [PROVIDER], autonomous: true, dayStart: '07:00', dayEnd: '23:00',
     ...(model ? { [{ 'workers-ai': 'workersAiModel', gemini: 'geminiModel', groq: 'groqModel', cerebras: 'cerebrasModel', openrouter: 'openrouterModel', mistral: 'mistralModel' }[PROVIDER]]: model } : {}) });
   // Only the chosen provider: blank the others' keys so the router cannot fall back silently.
   const st = load('settings');

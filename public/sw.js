@@ -1,7 +1,7 @@
 // Offline shell: the app opens instantly from the saved copy, and updates itself in the background
 // (stale-while-revalidate), so a slow network never delays opening it. Data is never cached here.
-const CACHE = 'donna-v4';
-const SHELL = ['/', '/app.css', '/app.js', '/icon.svg', '/icon-192.png', '/manifest.webmanifest', '/login.html'];
+const CACHE = 'donna-b442509718';
+const SHELL = ['/', '/app.css', '/app.js', '/icon.svg', '/icon-192.png', '/manifest.webmanifest', '/login.html', '/login.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).catch(() => {})); self.skipWaiting(); });
 self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))); self.clients.claim(); });
 self.addEventListener('fetch', e => {

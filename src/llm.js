@@ -19,6 +19,8 @@ const OPENAI_COMPAT = {
 };
 export const PROVIDERS = ['workers-ai', 'gemini', ...Object.keys(OPENAI_COMPAT)];
 const GEMINI_FALLBACKS = ['gemini-flash-lite-latest', 'gemini-flash-latest'];
+const SLOW_MS = 12000; // with another model to fall back on, don't wait longer than this
+const slowBlock = 120e3; // a hanging model is skipped for a while, so the next requests go straight to one that works
 
 let aiBinding = null;
 /** The Worker passes env.AI here; tests pass a fake. */
@@ -52,10 +54,16 @@ const untilMidnightUtc = () => { const d = new Date(); d.setUTCHours(24, 0, 5, 0
 /** Gemini quotas reset at midnight Pacific ≈ 08:00 UTC. */
 const untilMidnightPacific = () => { const d = new Date(); d.setUTCHours(8, 0, 5, 0); if (d <= Date.now()) d.setUTCDate(d.getUTCDate() + 1); return d - Date.now(); };
 
+/**
+ * Providers whose free tier may use prompts to train or improve models, or have people read them
+ * (Gemini API terms for unpaid quota; OpenRouter ":free" models depend on the upstream host).
+ * With privateAi on (off by default), calendar text never goes to them.
+ */
+export const MAY_TRAIN = new Set(['gemini', 'openrouter']);
 /** Providers that are configured, in the user's order. */
 export function configured(s = settings()) {
   const order = [...new Set([...(s.aiOrder || []), ...PROVIDERS])].filter(p => PROVIDERS.includes(p));
-  return order.filter(p => p === 'workers-ai' ? !!aiBinding && !!s.workersAiModel : !!s[keyField(p)]);
+  return order.filter(p => (p === 'workers-ai' ? !!aiBinding && !!s.workersAiModel : !!s[keyField(p)]) && !(s.privateAi === true && MAY_TRAIN.has(p)));
 }
 const keyField = p => ({ gemini: 'geminiApiKey', groq: 'groqApiKey', cerebras: 'cerebrasApiKey', openrouter: 'openrouterApiKey', mistral: 'mistralApiKey' })[p];
 const modelOf = (p, s) => ({ 'workers-ai': s.workersAiModel, gemini: s.geminiModel, groq: s.groqModel, cerebras: s.cerebrasModel, openrouter: s.openrouterModel, mistral: s.mistralModel })[p];
@@ -69,7 +77,7 @@ export function providerStatus() {
     const model = modelOf(p, s);
     const key = `${p}:${model}`;
     const blk = b[key] || b[p];
-    return { id: p, model, ready: configured(s).includes(p), blocked: blk ? { until: new Date(blk.until).toISOString(), why: blk.why } : null, callsToday: u.calls[key] || 0 };
+    return { id: p, model, ready: configured(s).includes(p), private: !MAY_TRAIN.has(p), skipped: s.privateAi === true && MAY_TRAIN.has(p) && (p === 'workers-ai' || !!s[keyField(p)]), blocked: blk ? { until: new Date(blk.until).toISOString(), why: blk.why } : null, callsToday: u.calls[key] || 0 };
   });
 }
 
@@ -93,6 +101,7 @@ export async function generate(req) {
   if (!order.length) throw new Error('No AI model is set up. On the hosted app this is automatic; on the laptop add a free Gemini key in Settings → AI.');
   const errors = [];
   const left = () => (req.deadline || Infinity) - Date.now();
+  const tries = order.flatMap(p => (p === 'gemini' ? [...new Set([s.geminiModel, ...GEMINI_FALLBACKS])] : [modelOf(p, s)]).map(m => `${p}:${m}`));
   for (const p of order) {
     const models = p === 'gemini' ? [...new Set([s.geminiModel, ...GEMINI_FALLBACKS])] : [modelOf(p, s)];
     for (const model of models) {
@@ -102,7 +111,8 @@ export async function generate(req) {
       for (let attempt = 0; attempt < 2; attempt++) {
         if (left() < 3000) throw new OutOfTime('Ran out of time waiting for the AI.');
         try {
-          const out = await call(p, model, { ...req, timeoutMs: Math.min(CALL_MS, left() - 1000) }, s);
+          const more = tries[tries.length - 1] !== key;
+          const out = await call(p, model, { ...req, timeoutMs: Math.min(more ? SLOW_MS : CALL_MS, left() - 1000) }, s);
           count(key, out.tokens || 0);
           return { ...out, provider: p, model };
         } catch (e) {
@@ -168,9 +178,25 @@ function callsFromText(text, toolNames) {
   return found;
 }
 
+/**
+ * gpt-oss sometimes leaks its hidden "analysis" channel into the visible text ("analysis: user wants…
+ * assistantfinal Done."). Keep only the final answer; null = nothing but reasoning came back (retry).
+ */
+export function stripChannels(t) {
+  const s = String(t || '');
+  if (!/^\s*(?:<\|channel\|>)?analysis(?![a-z])/.test(s)) return s; // "analysis: …", "analysisWe need…"
+  const m = /(?:assistant\s*final|<\|channel\|>final<\|message\|>|\bfinal\s*:)\s*([\s\S]*)$/i.exec(s);
+  return m ? m[1].trim() : null;
+}
+
 function normalizeOpenAi(message, tools) {
   const names = new Set((tools || []).map(t => t.name));
   let text = stripThink(message.content);
+  const cleaned = stripChannels(text);
+  if (cleaned === null) {
+    if (!(message.tool_calls || []).length) throw new ProviderError('model returned only its reasoning', { retryMs: 300 });
+    text = '';
+  } else text = cleaned;
   let calls = (message.tool_calls || []).map(c => {
     const f = c.function || c;
     return { id: newCallId(), name: f.name, args: parseArgs(f.arguments ?? f.parameters) };
@@ -211,6 +237,7 @@ async function callOpenAi(p, model, req, key) {
   const body = { model, messages: toOpenAiMessages(req.system, req.messages), temperature: 0.2, max_tokens: req.maxTokens || 2048 };
   const tools = toOpenAiTools(req.tools);
   if (tools) { body.tools = tools; body.tool_choice = 'auto'; }
+  if ((p === 'groq' || p === 'cerebras') && /gpt-oss/.test(model)) body.reasoning_effort = 'low'; // thinking is billed as output
   let res, text;
   try {
     res = await fetchImpl(OPENAI_COMPAT[p].url, {
@@ -220,7 +247,7 @@ async function callOpenAi(p, model, req, key) {
       signal: AbortSignal.timeout(req.timeoutMs || CALL_MS),
     });
     text = await res.text();
-  } catch (e) { throw new ProviderError(`network: ${e.message}`, { retryMs: 1000, blockMs: 30e3 }); }
+  } catch (e) { throw /timeout|abort/i.test(`${e.name} ${e.message}`) ? new ProviderError('timed out', { blockMs: slowBlock }) : new ProviderError(`network: ${e.message}`, { retryMs: 1000, blockMs: 30e3 }); }
   if (res.status === 401 || res.status === 403) throw new ProviderError(`${OPENAI_COMPAT[p].label} rejected the API key`, { blockMs: 6 * 3600e3, fatal: true });
   if (res.status === 429) {
     const ra = Number(res.headers.get('retry-after')) * 1000 || 0;
@@ -229,6 +256,8 @@ async function callOpenAi(p, model, req, key) {
   }
   if (res.status === 404 || res.status === 400 && /model/i.test(text) && /not|exist|found|decommission/i.test(text)) throw new ProviderError(`model ${model} unavailable`, { blockMs: 12 * 3600e3 });
   if (res.status >= 500) throw new ProviderError(`${OPENAI_COMPAT[p].label} ${res.status}`, { retryMs: 1500, blockMs: 60e3 });
+  // The model produced one malformed tool call: try again, the provider itself is fine.
+  if (res.status === 400 && /tool call validation|failed_generation|tool_use_failed/i.test(text)) throw new ProviderError(`${OPENAI_COMPAT[p].label}: malformed tool call`, { retryMs: 300 });
   if (!res.ok) throw new ProviderError(`${OPENAI_COMPAT[p].label} ${res.status}: ${text.slice(0, 160)}`, { blockMs: 5 * 60e3 });
   const data = JSON.parse(text);
   const msg = data.choices && data.choices[0] && data.choices[0].message || {};
@@ -275,7 +304,8 @@ async function callGemini(model, req, key) {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body), signal: AbortSignal.timeout(req.timeoutMs || CALL_MS),
     });
     text = await res.text();
-  } catch (e) { throw new ProviderError(`network: ${e.message}`, { retryMs: 1000, blockMs: 30e3 }); }
+  } catch (e) { throw /timeout|abort/i.test(`${e.name} ${e.message}`) ? new ProviderError('timed out', { blockMs: slowBlock }) : new ProviderError(`network: ${e.message}`, { retryMs: 1000, blockMs: 30e3 }); }
+  if (/location is not supported/i.test(text)) throw new ProviderError('Gemini is not available from this server location', { blockMs: 3600e3, fatal: true });
   if (res.status === 404) throw new ProviderError(`model ${model} retired`, { blockMs: 24 * 3600e3 });
   if (res.status === 429) {
     const m = /"retryDelay":\s*"(\d+(?:\.\d+)?)s"/.exec(text);
