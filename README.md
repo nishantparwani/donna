@@ -19,7 +19,7 @@ Free to run: Cloudflare Workers + D1 + Workers AI, a small Google Apps Script br
 | You say | Donna does |
 |---|---|
 | "CVT 2h tomorrow" | Picks the **best** slot, not the first one: study goes into your peak-focus hours |
-| "Plan my day: CVT 2h, project, 5k run, assignments — max productivity" | Builds the whole day around fixed classes: focus-length blocks, breaks, lunch and dinner, no useless 20-minute scraps |
+| "Plan my day: CVT 2h, project, 15k run, assignments — max productivity" | Builds the whole day around fixed classes: focus-length blocks, breaks, lunch and dinner, no useless 20-minute scraps |
 | "OS assignment due Friday, ~4 hours" | Books study sessions spread over the days before it's due, with a day of slack |
 | "Cancel SE and AI lecture, write CVT instead" | Cancels exactly those two (course codes and typos understood) and books CVT in the freed time |
 | "I woke up just now" | Re-plans the rest of today from now, keeping classes fixed |
@@ -29,7 +29,7 @@ Free to run: Cloudflare Workers + D1 + Workers AI, a small Google Apps Script br
 | "Travel 12 to 3pm color red" | High-priority booking: clears conflicting lower-priority events with one-tap Undo |
 | "Call with Priya tomorrow 3pm and invite her" | Sends a Google invite with a Meet link (never emails anyone unless asked) |
 | "undo that" | Reverts the whole last request |
-
+Understands more than one language as well!
 **Evening autopilot:** open the app after 6 pm and Donna gets tomorrow ready on her own: task sessions,
 habits, buffers around exams and interviews, clashes fixed.
 
